@@ -133,6 +133,27 @@
   #toolbar button:hover{background:#2b323f; color:var(--fg)}
   #toolbar button.on{background:#1f3a52; color:#cfe8ff}
 
+  #editbar{
+    position:absolute; left:50%; transform:translateX(-50%); bottom:58px;
+    display:none; align-items:center; gap:5px; background:rgba(25,28,36,.94);
+    border:1px solid var(--line); border-radius:11px; padding:6px 8px;
+    backdrop-filter:blur(8px); max-width:min(760px, 90%); flex-wrap:wrap;
+  }
+  #editbar.on{display:flex}
+  #editbar .sw{
+    width:23px; height:23px; border-radius:6px; border:2px solid transparent;
+    cursor:pointer; padding:0; box-sizing:border-box;
+  }
+  #editbar .sw.on{border-color:#cfe8ff; box-shadow:0 0 0 2px rgba(90,160,255,.4)}
+  #editbar .ebtn{
+    background:#2b323f; border:none; color:var(--dim); font-family:inherit;
+    font-size:11.5px; padding:5px 10px; border-radius:7px; cursor:pointer;
+  }
+  #editbar .ebtn:hover{background:#38414f; color:var(--fg)}
+  #editbar .ehint{font-size:11px; color:#6d7484; margin-left:2px}
+
+  body.editing #toast{ bottom:124px }   /* 編集バーと重ねない */
+
   #toast{
     position:absolute; left:50%; transform:translateX(-50%); bottom:70px;
     background:#233042; border:1px solid #38506b; color:#d8e8f7; padding:8px 15px;
@@ -180,7 +201,9 @@
       <input type="range" id="sliceRange" orient="vertical" min="1" max="10" value="10">
       <div class="lab">層</div>
     </div>
+    <div id="editbar"></div>
     <div id="toolbar">
+      <button id="btnEdit">なおす</button>
       <button id="btnSpin">自動回転</button>
       <button id="btnGrid" class="on">グリッド</button>
       <button id="btnEdge" class="on">枠線</button>
@@ -857,7 +880,7 @@ function buildMesh(m, opt){
       // AOの向きに合わせて三角形の対角を反転（縞を防ぐ）
       if(ao[0]+ao[2] > ao[1]+ao[3]) Is.push(start,start+1,start+2, start,start+2,start+3);
       else                          Is.push(start+1,start+2,start+3, start+1,start+3,start);
-      if(!ghost) faceMap.push({x,y,z,k},{x,y,z,k});
+      if(!ghost){ const rc = {x,y,z,k,d:f.d}; faceMap.push(rc,rc); }   // dは面の外向き＝置く方向
       // 枠線
       if(!ghost && edges < edgeBudget){
         const q=[];
@@ -922,10 +945,11 @@ function fitCam(m){
   applyCam();
 }
 (function bindCam(){
-  let mode=0, px=0, py=0, pinch=0;
+  let mode=0, px=0, py=0, pinch=0, downAt=null;
   const dn = e=>{
     CV.setPointerCapture && e.pointerId!=null && CV.setPointerCapture(e.pointerId);
     mode = (e.button===2 || e.shiftKey) ? 2 : 1; px=e.clientX; py=e.clientY;
+    downAt = { x:e.clientX, y:e.clientY, b:e.button, alt:e.altKey };
   };
   const mv = e=>{
     if(!mode) return;
@@ -941,7 +965,14 @@ function fitCam(m){
     }
     applyCam();
   };
-  const up = ()=> mode = 0;
+  const up = e=>{
+    // ドラッグならカメラ操作、その場で離したなら編集。距離で切り分ける。
+    if(S.edit && downAt && e){
+      const d = Math.hypot((e.clientX||0)-downAt.x, (e.clientY||0)-downAt.y);
+      if(d < 5) doEdit(downAt.x, downAt.y, downAt.b, downAt.alt);
+    }
+    downAt = null; mode = 0;
+  };
   CV.addEventListener('pointerdown', dn);
   addEventListener('pointermove', mv);
   addEventListener('pointerup', up);
@@ -979,7 +1010,7 @@ function loop(){
 /* ==========================================================================
    UI
    ========================================================================== */
-const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[] };
+const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null };
 const $ = s => document.querySelector(s);
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -1007,6 +1038,117 @@ function download(name, text, type){
   saveBlob(name, new Blob([text], {type:type||'application/json'}));
 }
 
+/* ==========================================================================
+   なおす — 立った後に1マスだけ直す
+   絵を描き直さず、JSONを手で書かず、その場で置く／消す。
+   ========================================================================== */
+const HIST = [];
+
+function snapshot(){
+  HIST.push({ size:S.model.size.slice(), data:S.model.data.slice() });
+  if(HIST.length > 40) HIST.shift();
+}
+
+function undoEdit(){
+  if(!HIST.length){ toast('もどせる操作がない'); return; }
+  const h = HIST.pop();
+  S.model = mkModel(h.size, h.data, S.model.palette, S.model.meta);
+  afterEdit();
+  toast('もどした');
+}
+
+/* 置きたい先が箱の外なら、箱の方を広げる。負の側なら中身ごとずらす。 */
+function growFor(x, y, z){
+  const m = S.model, [X,Y,Z] = m.size;
+  const ox = x<0 ? -x : 0, oy = y<0 ? -y : 0, oz = z<0 ? -z : 0;
+  const nX = Math.max(X+ox, x+ox+1), nY = Math.max(Y+oy, y+oy+1), nZ = Math.max(Z+oz, z+oz+1);
+  if(nX === X && nY === Y && nZ === Z) return [x,y,z];
+  if(nX*nY*nZ > 500000) return null;
+  const nd = new Array(nX*nY*nZ).fill('.');
+  for(let yy=0; yy<Y; yy++) for(let zz=0; zz<Z; zz++) for(let xx=0; xx<X; xx++){
+    nd[((yy+oy)*nZ + (zz+oz))*nX + (xx+ox)] = m.data[(yy*Z+zz)*X+xx];
+  }
+  S.model = mkModel([nX,nY,nZ], nd, m.palette, m.meta);
+  return [x+ox, y+oy, z+oz];
+}
+
+function setCell(x, y, z, k){
+  const m = S.model, [X,Y,Z] = m.size;
+  if(x<0||y<0||z<0||x>=X||y>=Y||z>=Z) return false;
+  m.data[(y*Z+z)*X+x] = k;
+  return true;
+}
+
+function afterEdit(){
+  const Y = S.model.size[1];
+  const sl = $('#sliceRange');
+  const wasAll = S.maxY >= (+sl.max) - 1;
+  sl.max = Y;
+  if(wasAll || S.maxY > Y-1){ S.maxY = Y-1; sl.value = Y; $('#sliceLab').textContent = '全層'; }
+  S.tal = tally(S.model);
+  if(S.solo && !S.tal.counts[S.solo]) S.solo = null;
+  rebuild(); renderMat(); renderInfo(); renderHUD();
+}
+
+function pickRec(cx, cy){
+  const r = CV.getBoundingClientRect();
+  const mouse = new THREE.Vector2(((cx-r.left)/r.width)*2-1, -((cy-r.top)/r.height)*2+1);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = meshMain ? raycaster.intersectObject(meshMain) : [];
+  return hits.length ? (faceMap[hits[0].faceIndex] || null) : null;
+}
+
+function doEdit(cx, cy, button, alt){
+  const rec = pickRec(cx, cy);
+  if(!rec){ toast('ブロックの上で押す'); return; }
+  const P = S.model.palette;
+  const nm = k => (P[k]||{}).name || k;
+
+  if(alt){                                  // 色を取る
+    S.brush = rec.k; renderEdit();
+    toast('この素材にした：' + nm(rec.k));
+    return;
+  }
+  if(button === 2){                         // 消す
+    snapshot();
+    setCell(rec.x, rec.y, rec.z, '.');
+    afterEdit();
+    toast('消した：' + nm(rec.k) + '　' + (rec.y+1) + '段目');
+    return;
+  }
+  // 置く — 押した面の外側へ
+  snapshot();
+  const p = growFor(rec.x + rec.d[0], rec.y + rec.d[1], rec.z + rec.d[2]);
+  if(!p){ HIST.pop(); toast('これ以上は広げられない', 3000); return; }
+  setCell(p[0], p[1], p[2], S.brush);
+  afterEdit();
+  toast('置いた：' + nm(S.brush) + '　' + (p[1]+1) + '段目');
+}
+
+function renderEdit(){
+  const bar = $('#editbar'), btn = $('#btnEdit');
+  bar.classList.toggle('on', !!S.edit);
+  btn.classList.toggle('on', !!S.edit);
+  document.body.classList.toggle('editing', !!S.edit);
+  if(!S.edit){ bar.innerHTML = ''; return; }
+  const P = S.model.palette, keys = Object.keys(P);
+  if(!S.brush || !P[S.brush]) S.brush = keys[0];
+  bar.innerHTML =
+    keys.map(k=>`<button class="sw ${k===S.brush?'on':''}" data-b="${esc(k)}" title="${esc(P[k].name)}" style="background:${P[k].color}"></button>`).join('')
+    + `<button class="ebtn" id="btnUndo">もどす</button>`
+    + `<span class="ehint">押す＝置く　右クリック＝消す　Alt＋押す＝色を取る</span>`;
+  bar.querySelectorAll('[data-b]').forEach(el=>{
+    el.onclick = ()=>{ S.brush = el.dataset.b; renderEdit(); };
+  });
+  $('#btnUndo').onclick = undoEdit;
+}
+
+addEventListener('keydown', e=>{
+  if(S.edit && (e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'z'){
+    e.preventDefault(); undoEdit();
+  }
+});
+
 /* ---------- 再描画 ---------- */
 function rebuild(){
   buildMesh(S.model, { maxY:S.maxY, solo:S.solo, hidden:S.hidden, grid:S.grid, edge:S.edge });
@@ -1021,7 +1163,8 @@ function setModel(m, opts){
   $('#sliceLab').textContent = '全層';
   rebuild();
   if(!opts || opts.fit !== false) fitCam(m);
-  renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD();
+  HIST.length = 0;
+  renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD(); renderEdit();
 }
 function renderHUD(){
   const m = S.model, t = S.tal;
@@ -1739,7 +1882,13 @@ $('#sliceRange').oninput = e=>{
   $('#sliceLab').textContent = (v >= S.model.size[1]) ? '全層' : v + '段';
   rebuild();
 };
+$('#btnEdit').onclick = ()=>{
+  S.edit = !S.edit;
+  renderEdit();
+  toast(S.edit ? 'なおすモード：押すと置く、右クリックで消す。回したいときはドラッグ' : 'なおすモードを切った');
+};
 CV.addEventListener('click', e=>{
+  if(S.edit) return;                       // なおすモード中は素材ソロ表示を止める
   const r = CV.getBoundingClientRect();
   const mouse = new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1, -((e.clientY-r.top)/r.height)*2+1);
   raycaster.setFromCamera(mouse, camera);
