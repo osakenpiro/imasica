@@ -161,12 +161,14 @@
       <button data-p="info" class="on">設計図</button>
       <button data-p="mat">素材</button>
       <button data-p="plan">積み方</button>
+      <button data-p="img">絵</button>
       <button data-p="io">入出力</button>
     </nav>
 
     <div class="pane on" id="pane-info"></div>
     <div class="pane" id="pane-mat"></div>
     <div class="pane" id="pane-plan"></div>
+    <div class="pane" id="pane-img"></div>
     <div class="pane" id="pane-io"></div>
   </aside>
 
@@ -1019,7 +1021,7 @@ function setModel(m, opts){
   $('#sliceLab').textContent = '全層';
   rebuild();
   if(!opts || opts.fit !== false) fitCam(m);
-  renderInfo(); renderMat(); renderPlan(); renderIO(); renderHUD();
+  renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD();
 }
 function renderHUD(){
   const m = S.model, t = S.tal;
@@ -1184,31 +1186,6 @@ function renderIO(){
   $('#pane-io').innerHTML = `
     <div class="tiny muted" style="margin-bottom:2px">形の入口は3つ。三相と同じ並びにしてある。</div>
 
-    <h2 class="sec">E ROSS ／ 絵から立てる</h2>
-    <div class="tiny muted" style="margin-bottom:7px">
-      情熱のまま描いた形を、そのまま通す。クリスタ等のラフを渡すと立体になる。
-      レイヤーを1枚ずつ書き出して全部選ぶと、下から順に段になる。
-    </div>
-    <select id="imgMode">
-      <option value="layers">レイヤー＝段（複数枚・下から順に積む）</option>
-      <option value="extrude">押し出し（1枚の正面図に厚みをつける）</option>
-      <option value="cross">正面×側面の交差（2枚・重なった所だけ残す）</option>
-      <option value="height">濃淡＝高さ（明るいほど高い・地形向き）</option>
-    </select>
-    <div style="display:flex; gap:7px; margin-top:7px">
-      <label class="tiny muted" style="flex:1">横のマス数
-        <input type="text" id="imgCols" value="24" style="margin-top:3px"></label>
-      <label class="tiny muted" style="flex:1; display:none" id="imgExtraWrap">厚み／最大の高さ
-        <input type="text" id="imgExtra" value="4" style="margin-top:3px"></label>
-    </div>
-    <select id="imgColor" style="margin-top:7px">
-      <option value="auto">絵の色をそのままブロックにする</option>
-      <option value="snap">いま開いているパレットの素材に寄せる</option>
-    </select>
-    <input type="file" id="imgFile" accept="image/*" multiple style="margin-top:7px; font-size:12px; width:100%">
-    <button class="btn pri" id="btnImg">選んだ絵から立てる
-      <small>ファイル名順に下の段から積む。大きい絵は自動で縮む</small></button>
-
     <h2 class="sec">WONDER ／ AIに描かせる</h2>
     <div class="tiny muted" style="margin-bottom:7px">
       自分の手の外から、まだ無い形が来る。注文を書いてボタンを押すと、仕様書つきのプロンプトが出る。
@@ -1257,6 +1234,7 @@ function renderIO(){
     </div>`;
 
   renderWorld();
+  $('#btnPrompt').onclick = ()=> copy(aiPrompt(S.model, $('#wantTxt').value.trim()), 'プロンプトを');
   $('#btnWorldAdd').onclick = ()=>{
     const m = S.model;
     S.world.push({ m, ...worldPlace(m), label:(m.meta.title||'名称未設定') });
@@ -1268,12 +1246,155 @@ function renderIO(){
   };
   $('#btnWorldClear').onclick = ()=>{ S.world = []; renderWorld(); toast('世界を空にした'); };
 
-  $('#btnPrompt').onclick = ()=> copy(aiPrompt(S.model, $('#wantTxt').value.trim()), 'プロンプトを');
-  $('#imgMode').onchange = e=>{
-    const m = e.target.value;
-    $('#imgExtraWrap').style.display = (m === 'layers' || m === 'cross') ? 'none' : '';
-    $('#imgExtra').value = (m === 'extrude') ? '4' : '12';
+  $('#btnLoad').onclick = ()=>{
+    const v = $('#jsonIn').value.trim();
+    if(!v){ toast('JSONを貼ってから押す'); return; }
+    try{
+      const m = fromJSON(v);
+      if(!m.data.some(k=>!AIR.has(k))){ toast('ブロックが1個も無い。layersの中身を確認'); return; }
+      setModel(m); toast('読み込んだ：' + (m.meta.title||'名称未設定'));
+    }catch(e){ toast('JSONが読めない：' + e.message, 4200); }
   };
+  $('#btnShare').onclick = async ()=>{
+    const packed = await packURL(toJSON(S.model,false));
+    const url = location.origin + location.pathname + '#d=' + packed;
+    if(url.length > 8000) toast('リンクが長い（'+Math.round(url.length/1024)+'KB）。共有できるが、JSONファイルの方が確実', 4000);
+    copy(url, '共有リンクを');
+  };
+  $('#btnDl').onclick = ()=>{
+    const name = (S.model.meta.title||'imasica').replace(/[\\/:*?"<>|]/g,'_');
+    download(name + '.imasica.json', toJSON(S.model,true));
+    toast('ダウンロードした');
+  };
+  $('#btnCopyJson').onclick = ()=> copy(toJSON(S.model,true), 'JSONを');
+  $('#btnBlender').onclick = ()=> copy(toBlenderPy(S.model), 'Blender用Pythonを');
+  $('#btnPng').onclick = exportCard;
+}
+
+/* ==========================================================================
+   タブ：絵（E ROSS） — 画像入力 ＋ 色辞書エディタ
+   ========================================================================== */
+const DICT_STORE = 'imasica.dicts';
+function loadDicts(){
+  if(S.dicts) return S.dicts;
+  let d = {};
+  try{ d = JSON.parse(localStorage.getItem(DICT_STORE) || '{}'); }catch(e){}
+  S.dicts = d; return d;
+}
+function persistDicts(){
+  try{ localStorage.setItem(DICT_STORE, JSON.stringify(S.dicts)); return true; }
+  catch(e){ return false; }   // artifact等ではメモリ上だけで生かす
+}
+
+function renderImg(){
+  const dicts = loadDicts();
+  const dictOpts = Object.keys(dicts).map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  const P = S.model ? S.model.palette : {};
+  const rows = Object.keys(P).map(k=>`
+    <div class="mat" style="cursor:default">
+      <input type="color" value="${P[k].color}" data-col="${esc(k)}"
+             style="width:26px;height:24px;padding:0;border:1px solid var(--line);border-radius:5px;background:none;cursor:pointer">
+      <code style="width:16px;text-align:center;color:var(--accent2)">${esc(k)}</code>
+      <input type="text" value="${esc(P[k].name)}" data-nm="${esc(k)}"
+             style="flex:1;min-width:0;padding:4px 6px;font-size:12px">
+    </div>`).join('');
+
+  $('#pane-img').innerHTML = `
+    <h2 class="sec">E ROSS ／ 絵から立てる</h2>
+    <div class="tiny muted" style="margin-bottom:7px">
+      情熱のまま描いた形を、そのまま通す。透明と真っ白は空気として捨てるので、白い紙のラフをそのまま渡せる。
+    </div>
+    <select id="imgMode">
+      <option value="layers">レイヤー＝段（複数枚・下から順に積む）</option>
+      <option value="extrude">押し出し（1枚の正面図に厚みをつける）</option>
+      <option value="cross">正面×側面の交差（2枚・重なった所だけ残す）</option>
+      <option value="height">濃淡＝高さ（明るいほど高い・地形向き）</option>
+    </select>
+    <div class="tiny muted" id="imgHint" style="margin-top:5px"></div>
+    <div style="display:flex; gap:7px; margin-top:7px">
+      <label class="tiny muted" style="flex:1">横のマス数
+        <input type="text" id="imgCols" value="24" style="margin-top:3px"></label>
+      <label class="tiny muted" style="flex:1; display:none" id="imgExtraWrap">厚み／最大の高さ
+        <input type="text" id="imgExtra" value="4" style="margin-top:3px"></label>
+    </div>
+    <select id="imgColor" style="margin-top:7px">
+      <option value="auto">絵の色をそのままブロックにする</option>
+      <option value="snap">下の色辞書の素材に寄せる</option>
+    </select>
+    <input type="file" id="imgFile" accept="image/*" multiple style="margin-top:7px; font-size:12px; width:100%">
+    <button class="btn pri" id="btnImg">選んだ絵から立てる
+      <small>ファイル名順に読む。大きい絵は自動で縮む</small></button>
+
+    <h2 class="sec">色辞書</h2>
+    <div class="tiny muted" style="margin-bottom:7px">
+      「この色＝この素材」の対応。色を押せば絵の側の色に合わせられ、名前は集計とテキスト出力にそのまま出る。
+      保存しておけば、次に絵を投げるとき「寄せる」で使える。
+    </div>
+    ${rows || '<div class="tiny muted">まだ何も読み込んでいない</div>'}
+    <div style="display:flex; gap:7px; margin-top:10px">
+      <input type="text" id="dictName" placeholder="辞書の名前（例：うみべ）" style="flex:1">
+      <button class="btn" id="btnDictSave" style="width:auto; margin:0; white-space:nowrap">保存</button>
+    </div>
+    <div style="display:flex; gap:7px; margin-top:7px">
+      <select id="dictPick" style="flex:1"><option value="">保存した辞書…</option>${dictOpts}</select>
+      <button class="btn" id="btnDictLoad" style="width:auto; margin:0; white-space:nowrap">当てる</button>
+      <button class="btn" id="btnDictDel" style="width:auto; margin:0; white-space:nowrap">削除</button>
+    </div>
+    <div class="tiny muted" id="dictNote" style="margin-top:6px"></div>`;
+
+  const hint = {
+    layers:'クリスタなら「レイヤーごとに書き出し」。下の段から順に並ぶようファイル名を 01, 02… にする。',
+    extrude:'1枚の立面ラフを奥へ伸ばす。屋根は板になるので、屋根を立体にしたいなら交差を使う。',
+    cross:'2枚いる。1枚目＝正面、2枚目＝側面。2枚目は1枚目と同じ背丈に自動で刻まれ、どちらも下端が地面。',
+    height:'グレースケールで塗ると起伏になる。白いほど高い。島や街の地盤に。'
+  };
+  const syncMode = ()=>{
+    const m = $('#imgMode').value;
+    $('#imgExtraWrap').style.display = (m === 'layers' || m === 'cross') ? 'none' : '';
+    $('#imgHint').textContent = hint[m] || '';
+    if(m === 'extrude') $('#imgExtra').value = '4';
+    if(m === 'height')  $('#imgExtra').value = '12';
+  };
+  $('#imgMode').onchange = syncMode; syncMode();
+
+  $('#pane-img').querySelectorAll('[data-col]').forEach(el=>{
+    el.oninput = ()=>{ S.model.palette[el.dataset.col].color = el.value; rebuild(); renderMat(); };
+  });
+  $('#pane-img').querySelectorAll('[data-nm]').forEach(el=>{
+    el.onchange = ()=>{ S.model.palette[el.dataset.nm].name = el.value; renderMat(); };
+  });
+
+  $('#btnDictSave').onclick = ()=>{
+    const nm = $('#dictName').value.trim();
+    if(!nm){ toast('辞書に名前をつける'); return; }
+    const d = {};
+    for(const k in S.model.palette){
+      const v = S.model.palette[k];
+      d[k] = { name:v.name, color:v.color, role:v.role||'', note:v.note||'' };
+    }
+    loadDicts()[nm] = d;
+    const ok = persistDicts();
+    renderImg();
+    toast(ok ? '「'+nm+'」を保存した' : '「'+nm+'」を保存（このセッション内のみ）');
+  };
+  $('#btnDictLoad').onclick = ()=>{
+    const nm = $('#dictPick').value;
+    if(!nm){ toast('辞書を選ぶ'); return; }
+    const d = loadDicts()[nm];
+    let hit = 0;
+    for(const k in d){ if(S.model.palette[k]){ S.model.palette[k] = { ...d[k] }; hit++; } else { S.model.palette[k] = { ...d[k] }; } }
+    S.tal = tally(S.model); rebuild(); renderMat(); renderImg(); renderInfo();
+    toast('「'+nm+'」を当てた（' + hit + '色が一致）');
+  };
+  $('#btnDictDel').onclick = ()=>{
+    const nm = $('#dictPick').value;
+    if(!nm){ toast('辞書を選ぶ'); return; }
+    delete loadDicts()[nm]; persistDicts(); renderImg(); toast('「'+nm+'」を消した');
+  };
+  $('#dictNote').textContent = Object.keys(dicts).length
+    ? '保存済み ' + Object.keys(dicts).length + ' 件'
+    : 'まだ辞書は無い。いま開いている素材の並びをそのまま保存できる。';
+
   $('#btnImg').onclick = async ()=>{
     const files = [...($('#imgFile').files || [])];
     if(!files.length){ toast('先に絵を選ぶ'); return; }
@@ -1304,29 +1425,6 @@ function renderIO(){
       toast(files.length + '枚から ' + n + 'ブロック立てた');
     }catch(e){ toast('読めなかった：' + e.message, 4200); }
   };
-  $('#btnLoad').onclick = ()=>{
-    const v = $('#jsonIn').value.trim();
-    if(!v){ toast('JSONを貼ってから押す'); return; }
-    try{
-      const m = fromJSON(v);
-      if(!m.data.some(k=>!AIR.has(k))){ toast('ブロックが1個も無い。layersの中身を確認'); return; }
-      setModel(m); toast('読み込んだ：' + (m.meta.title||'名称未設定'));
-    }catch(e){ toast('JSONが読めない：' + e.message, 4200); }
-  };
-  $('#btnShare').onclick = async ()=>{
-    const packed = await packURL(toJSON(S.model,false));
-    const url = location.origin + location.pathname + '#d=' + packed;
-    if(url.length > 8000) toast('リンクが長い（'+Math.round(url.length/1024)+'KB）。共有できるが、JSONファイルの方が確実', 4000);
-    copy(url, '共有リンクを');
-  };
-  $('#btnDl').onclick = ()=>{
-    const name = (S.model.meta.title||'imasica').replace(/[\\/:*?"<>|]/g,'_');
-    download(name + '.imasica.json', toJSON(S.model,true));
-    toast('ダウンロードした');
-  };
-  $('#btnCopyJson').onclick = ()=> copy(toJSON(S.model,true), 'JSONを');
-  $('#btnBlender').onclick = ()=> copy(toBlenderPy(S.model), 'Blender用Pythonを');
-  $('#btnPng').onclick = exportCard;
 }
 
 /* ---------- 世界（複数の建物を並べて1つにする） ---------- */
