@@ -1192,6 +1192,7 @@ function renderIO(){
     <select id="imgMode">
       <option value="layers">レイヤー＝段（複数枚・下から順に積む）</option>
       <option value="extrude">押し出し（1枚の正面図に厚みをつける）</option>
+      <option value="cross">正面×側面の交差（2枚・重なった所だけ残す）</option>
       <option value="height">濃淡＝高さ（明るいほど高い・地形向き）</option>
     </select>
     <div style="display:flex; gap:7px; margin-top:7px">
@@ -1270,7 +1271,7 @@ function renderIO(){
   $('#btnPrompt').onclick = ()=> copy(aiPrompt(S.model, $('#wantTxt').value.trim()), 'プロンプトを');
   $('#imgMode').onchange = e=>{
     const m = e.target.value;
-    $('#imgExtraWrap').style.display = (m === 'layers') ? 'none' : '';
+    $('#imgExtraWrap').style.display = (m === 'layers' || m === 'cross') ? 'none' : '';
     $('#imgExtra').value = (m === 'extrude') ? '4' : '12';
   };
   $('#btnImg').onclick = async ()=>{
@@ -1283,7 +1284,14 @@ function renderIO(){
     toast('絵を読んでいる…');
     try{
       const imgs = await Promise.all(files.map(loadImage));
-      const shots = imgs.map(im => rasterize(im, cols));
+      let shots;
+      if(mode === 'cross'){
+        if(imgs.length < 2){ toast('交差は2枚いる（1枚目＝正面、2枚目＝側面）', 4000); return; }
+        const front = rasterize(imgs[0], cols);
+        shots = [front, rasterizeH(imgs[1], front.h)];   // 側面は正面と同じ背丈に刻む
+      } else {
+        shots = imgs.map(im => rasterize(im, cols));
+      }
       const m = imagesToModel(shots, {
         mode, colorMode:$('#imgColor').value, maxColors:10,
         depth:extra, maxH:extra,
@@ -1463,6 +1471,14 @@ function loadImage(file){
 function rasterize(im, cols){
   const w = Math.max(1, Math.min(cols, 96));
   const h = Math.max(1, Math.round(im.height * (w / im.width)));
+  return rasterAt(im, w, h);
+}
+function rasterizeH(im, rows){          // 高さを合わせて刻む（交差モードで2枚の背丈を揃える）
+  const h = Math.max(1, Math.min(rows, 96));
+  const w = Math.max(1, Math.min(96, Math.round(im.width * (h / im.height))));
+  return rasterAt(im, w, h);
+}
+function rasterAt(im, w, h){
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const g = c.getContext('2d', { willReadFrequently:true });
   g.drawImage(im, 0, 0, w, h);
@@ -1549,6 +1565,24 @@ function imagesToModel(shots, opt, palette){
       const k = mp.map(r,g,b), y = s.h-1-py2;         // 画像は上が0、世界は上が最大
       for(let z=0;z<Z;z++) put(x, y, z, k);
     }
+  } else if(opt.mode === 'cross'){                     // 正面 × 側面 の交差
+    const a = shots[0], b = shots[1] || shots[0];      // a=正面(x,y)  b=側面(z,y)
+    X = a.w; Y = a.h; Z = b.w;
+    data = new Array(X*Y*Z).fill('.');
+    for(let y=0;y<Y;y++){
+      const ay = a.h-1-y, by = b.h-1-y;                // どちらも下端を地面に合わせる
+      if(by < 0 || by >= b.h) continue;
+      for(let x=0;x<X;x++){
+        const [ar,ag,ab,aa] = px(a, x, ay);
+        if(isAir(ar,ag,ab,aa)) continue;               // 正面が抜けていれば、その柱は無い
+        const k = mp.map(ar,ag,ab);
+        for(let z=0;z<Z;z++){
+          const [br,bg,bb,ba] = px(b, z, by);
+          if(isAir(br,bg,bb,ba)) continue;             // 側面も埋まっている所だけ残る
+          put(x, y, z, k);
+        }
+      }
+    }
   } else {                                             // height
     const s = shots[0];
     X = s.w; Z = s.h; Y = Math.max(1, opt.maxH);
@@ -1562,7 +1596,7 @@ function imagesToModel(shots, opt, palette){
       for(let y=0;y<hgt;y++) put(x, y, z, k);
     }
   }
-  const label = { layers:'レイヤー＝段', extrude:'押し出し', height:'濃淡＝高さ' }[opt.mode];
+  const label = { layers:'レイヤー＝段', extrude:'押し出し', height:'濃淡＝高さ', cross:'正面×側面' }[opt.mode];
   return mkModel([X,Y,Z], data, mp.palette, {
     title: opt.title || ('絵から立てた形（' + label + '）'),
     author:'', target:'generic', scale_m:1,
