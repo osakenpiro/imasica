@@ -37,6 +37,8 @@
   #brand{padding:14px 16px 10px; border-bottom:1px solid var(--line)}
   #brand h1{margin:0; font-size:17px; letter-spacing:.06em; font-weight:700}
   #brand .sub{color:var(--dim); font-size:11.5px; margin-top:2px; letter-spacing:.04em}
+  #saveDot{opacity:0; transition:opacity .25s; color:var(--accent2); margin-left:6px}
+  #saveDot.on{opacity:1}
   #tabs{display:flex; border-bottom:1px solid var(--line); background:var(--panel)}
   #tabs button{
     flex:1; padding:10px 4px; background:none; border:none; border-bottom:2px solid transparent;
@@ -176,7 +178,7 @@
   <aside id="side">
     <div id="brand">
       <h1>IMASICA</h1>
-      <div class="sub">想像を立体で書く ／ IMASICA形式 v0</div>
+      <div class="sub">想像を立体で書く ／ IMASICA形式 v0 <span id="saveDot"></span></div>
     </div>
     <nav id="tabs">
       <button data-p="info" class="on">設計図</button>
@@ -528,6 +530,20 @@ const SAMPLES = [];
    CORE — 読み込み・正規化・集計・変換
    ========================================================================== */
 
+/* 大きさの上限。ここを越えると描画より先にタブが死ぬので、死ぬ前に人が読める形で止める。
+   500,000 は「なおす」で箱を広げるときの上限と同じ値に揃えてある。 */
+const LIMIT = { cells: 500000 };
+function guardSize(X, Y, Z, what){
+  if(!(X > 0 && Y > 0 && Z > 0) || !isFinite(X*Y*Z)){
+    throw new Error((what||'') + '大きさが読めない（' + X + '×' + Y + '×' + Z + '）');
+  }
+  const n = X * Y * Z;
+  if(n > LIMIT.cells){
+    throw new Error((what||'') + '大きすぎる：' + X + '×' + Y + '×' + Z + '＝' +
+      n.toLocaleString() + 'マス。' + LIMIT.cells.toLocaleString() + 'マスまで');
+  }
+}
+
 function mkModel(size, data, palette, meta){
   const [X,Y,Z] = size;
   const m = { size:[X,Y,Z], data, palette, meta:meta||{} };
@@ -566,12 +582,14 @@ function fromJSON(raw){
   }
   const vox = raw.voxels || raw.layers || [];
   let X,Y,Z,data;
+  const warn = [];
 
   if(Array.isArray(vox) && typeof vox[0] === 'object' && Array.isArray(vox[0])){
     // list 記法 [[x,y,z,k],...]
     let mx=0,my=0,mz=0;
     vox.forEach(v=>{ mx=Math.max(mx,v[0]); my=Math.max(my,v[1]); mz=Math.max(mz,v[2]); });
     [X,Y,Z] = raw.size || [mx+1,my+1,mz+1];
+    guardSize(X,Y,Z);
     data = new Array(X*Y*Z).fill('.');
     vox.forEach(([x,y,z,k])=>{ if(x<X&&y<Y&&z<Z) data[(y*Z+z)*X+x] = k; });
   } else {
@@ -580,13 +598,24 @@ function fromJSON(raw){
       const L = vox.list;
       let mx=0,my=0,mz=0; L.forEach(v=>{mx=Math.max(mx,v[0]);my=Math.max(my,v[1]);mz=Math.max(mz,v[2]);});
       [X,Y,Z] = raw.size || [mx+1,my+1,mz+1];
+      guardSize(X,Y,Z);
       data = new Array(X*Y*Z).fill('.');
       L.forEach(([x,y,z,k])=>{ if(x<X&&y<Y&&z<Z) data[(y*Z+z)*X+x]=k; });
     } else {
+      if(!layers.length) throw new Error('layers が空。段が1つも無い');
       Y = layers.length;
       Z = Math.max(...layers.map(l=>l.length));
       X = Math.max(...layers.map(l=>Math.max(...l.map(r=>String(r).length))));
       if(raw.size){ X=Math.max(X,raw.size[0]); Y=Math.max(Y,raw.size[1]); Z=Math.max(Z,raw.size[2]); }
+      guardSize(X,Y,Z);
+      // 行の長さが揃っていないと、足りない分は黙って空気になる。黙らせない。
+      let ragged = 0, shortRows = 0;
+      layers.forEach(l=>{
+        if(l.length !== Z) shortRows++;
+        l.forEach(r=>{ if(String(r).length !== X) ragged++; });
+      });
+      if(ragged) warn.push('行の長さが揃っていない（' + ragged + '行）。足りない分は空気として読んだ');
+      if(shortRows) warn.push('段ごとの行数が揃っていない（' + shortRows + '段）');
       data = new Array(X*Y*Z).fill('.');
       layers.forEach((layer,y)=>{
         layer.forEach((row,z)=>{
@@ -604,7 +633,9 @@ function fromJSON(raw){
       palette[k] = { name:'未定義ブロック「'+k+'」', color:auto[ai++ % auto.length], role:ROLE[k]||'', note:'パレット未定義' };
     }
   }
-  return mkModel([X,Y,Z], data, palette, meta);
+  const mm = mkModel([X,Y,Z], data, palette, meta);
+  mm.warn = warn;
+  return mm;
 }
 
 /* model → layers 記法 JSON */
@@ -1024,7 +1055,7 @@ function loop(){
 /* ==========================================================================
    UI
    ========================================================================== */
-const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null };
+const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null, dirty:false };
 const $ = s => document.querySelector(s);
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -1053,22 +1084,122 @@ function download(name, text, type){
 }
 
 /* ==========================================================================
+   保存 — 閉じても消えない
+   「動いたけど使わない」の一番大きい原因は、次に開いたとき前回が無いこと。
+   置き場は localStorage。同じドメインに他のツールも同居するので imasica. で名前を分ける。
+   読めなかった保存は消さずに .broken へ退避する（消したら復旧の手が無くなる）。
+   共有リンクで開いただけ／見本を出しただけでは書かない＝人の作業を上書きしない。
+   ========================================================================== */
+const SAVE_KEY    = 'imasica.autosave';
+const SAVE_BROKEN = 'imasica.autosave.broken';
+const SAVE_MAX    = 3000000;      // localStorage は概ね5MB。世界ごと入れても収まる所で切る
+let _saveT = null, _saveWarned = false;
+
+function saveNow(){
+  _saveT = null;
+  if(!S.model || !S.dirty) return;
+  let s;
+  try{
+    s = JSON.stringify({
+      v:1, at:Date.now(),
+      model: toJSON(S.model, false),
+      world: S.world.map(it=>({ json:toJSON(it.m,false), ox:it.ox|0, oy:it.oy|0, oz:it.oz|0, label:it.label }))
+    });
+  }catch(e){ console.warn(e); return; }
+  if(s.length > SAVE_MAX){
+    if(!_saveWarned){ _saveWarned = true;
+      toast('大きすぎて自動保存できない。入出力タブからJSONを落として残して', 5200); }
+    return;
+  }
+  try{ localStorage.setItem(SAVE_KEY, s); _saveWarned = false; markSaved(); }
+  catch(e){
+    if(!_saveWarned){ _saveWarned = true;
+      toast('自動保存できない（保存領域が一杯かも）。JSONを落として残して', 5200); }
+  }
+}
+function saveSoon(){ S.dirty = true; clearTimeout(_saveT); _saveT = setTimeout(saveNow, 800); }
+addEventListener('beforeunload', ()=>{ if(_saveT) saveNow(); });
+
+/* 同じ端末で2枚開いていると、保存の置き場は1つなので後から書いた方が残る。
+   黙って片方が消えるのが一番痛いので、起きた時に1回だけ言う。 */
+let _clashSaid = false;
+addEventListener('storage', e=>{
+  if(e.key !== SAVE_KEY || !S.dirty || _clashSaid) return;
+  _clashSaid = true;
+  toast('別のタブでもIMASICAを触っている。保存は後から書いた方が残る。片方はJSONで落として', 6000);
+});
+
+function restoreSaved(){
+  let raw = null;
+  try{ raw = localStorage.getItem(SAVE_KEY); }catch(e){ return null; }
+  if(!raw) return null;
+  try{
+    const o = JSON.parse(raw);
+    if(!o || !o.model) return null;
+    return {
+      m: fromJSON(o.model),
+      world: (o.world||[]).map(it=>({ m:fromJSON(it.json), ox:it.ox|0, oy:it.oy|0, oz:it.oz|0, label:it.label||'' })),
+      at: o.at || 0
+    };
+  }catch(e){
+    try{ localStorage.setItem(SAVE_BROKEN, raw); localStorage.removeItem(SAVE_KEY); }catch(_){}
+    console.warn('保存が読めなかったので imasica.autosave.broken に退避した', e);
+    return null;
+  }
+}
+function agoText(ms){
+  if(!ms) return '';
+  const d = Math.max(0, Date.now() - ms), h = d/3600000;
+  if(h < 1)  return Math.max(1, Math.round(d/60000)) + '分前';
+  if(h < 24) return Math.round(h) + '時間前';
+  return Math.round(h/24) + '日前';
+}
+function markSaved(){
+  const el = $('#saveDot');
+  if(!el) return;
+  el.textContent = '保存ずみ';
+  el.classList.add('on');
+  clearTimeout(markSaved._t);
+  markSaved._t = setTimeout(()=>el.classList.remove('on'), 1400);
+}
+
+/* 人の意図で形が入れ替わる時だけ通す口。ここを通ると保存され、Ctrl+Z で前の形に戻れる。 */
+function applyModel(m, label){
+  setModel(m, { from: label || '入れ替え前の形' });
+  saveSoon();
+  if(m.warn && m.warn.length) setTimeout(()=>toast('読めたが注意：' + m.warn.join(' ／ '), 5200), 900);
+}
+
+/* ==========================================================================
    なおす — 立った後に1マスだけ直す
    絵を描き直さず、JSONを手で書かず、その場で置く／消す。
    ========================================================================== */
 const HIST = [];
+const HIST_CELLS = 3000000;   // 覚えておく総マス数の上限。大きい形を40手ぶん抱えると落ちる
 
-function snapshot(){
-  HIST.push({ size:S.model.size.slice(), data:S.model.data.slice() });
-  if(HIST.length > 40) HIST.shift();
+function histTrim(){
+  let n = 0;
+  for(const h of HIST) n += h.data.length;
+  while(HIST.length > 1 && (HIST.length > 40 || n > HIST_CELLS)) n -= HIST.shift().data.length;
+}
+
+function snapshot(label){
+  HIST.push({
+    size: S.model.size.slice(), data: S.model.data.slice(),
+    palette: S.model.palette, meta: S.model.meta, label: label || ''
+  });
+  histTrim();
 }
 
 function undoEdit(){
   if(!HIST.length){ toast('もどせる操作がない'); return; }
   const h = HIST.pop();
-  S.model = mkModel(h.size, h.data, S.model.palette, S.model.meta);
+  const resized = h.size.join() !== S.model.size.join();
+  S.model = mkModel(h.size, h.data, h.palette || S.model.palette, h.meta || S.model.meta);
   afterEdit();
-  toast('もどした');
+  if(resized){ renderPlan(); renderImg(); fitCam(S.model); }
+  renderEdit();
+  toast(h.label ? ('もどした：' + h.label) : 'もどした');
 }
 
 /* 置きたい先が箱の外なら、箱の方を広げる。負の側なら中身ごとずらす。 */
@@ -1077,7 +1208,7 @@ function growFor(x, y, z){
   const ox = x<0 ? -x : 0, oy = y<0 ? -y : 0, oz = z<0 ? -z : 0;
   const nX = Math.max(X+ox, x+ox+1), nY = Math.max(Y+oy, y+oy+1), nZ = Math.max(Z+oz, z+oz+1);
   if(nX === X && nY === Y && nZ === Z) return [x,y,z];
-  if(nX*nY*nZ > 500000) return null;
+  if(nX*nY*nZ > LIMIT.cells) return null;
   const nd = new Array(nX*nY*nZ).fill('.');
   for(let yy=0; yy<Y; yy++) for(let zz=0; zz<Z; zz++) for(let xx=0; xx<X; xx++){
     nd[((yy+oy)*nZ + (zz+oz))*nX + (xx+ox)] = m.data[(yy*Z+zz)*X+xx];
@@ -1102,6 +1233,7 @@ function afterEdit(){
   S.tal = tally(S.model);
   if(S.solo && !S.tal.counts[S.solo]) S.solo = null;
   rebuild(); renderMat(); renderInfo(); renderHUD();
+  saveSoon();
 }
 
 function pickRec(cx, cy){
@@ -1146,9 +1278,16 @@ function renderEdit(){
   document.body.classList.toggle('editing', !!S.edit);
   if(!S.edit){ bar.innerHTML = ''; return; }
   const P = S.model.palette, keys = Object.keys(P);
-  if(!S.brush || !P[S.brush]) S.brush = keys[0];
+  // 既定を Object.keys の1番目にすると、その形に1個も使われていない素材が生えてくる。
+  // 実際に一番多く使われている素材を初期値にする。
+  if(!S.brush || !P[S.brush]){
+    const c = (S.tal && S.tal.counts) || {};
+    const used = keys.filter(k=>c[k]).sort((a,b)=>c[b]-c[a]);
+    S.brush = used[0] || keys[0];
+  }
   bar.innerHTML =
     keys.map(k=>`<button class="sw ${k===S.brush?'on':''}" data-b="${esc(k)}" title="${esc(P[k].name)}" style="background:${P[k].color}"></button>`).join('')
+    + `<span class="ehint" style="margin:0 8px 0 4px;color:var(--fg)">${esc((P[S.brush]||{}).name || S.brush)}</span>`
     + `<button class="ebtn" id="btnUndo">もどす</button>`
     + `<span class="ehint">押す＝置く　右クリック＝消す　Alt＋押す＝色を取る</span>`;
   bar.querySelectorAll('[data-b]').forEach(el=>{
@@ -1158,8 +1297,14 @@ function renderEdit(){
 }
 
 addEventListener('keydown', e=>{
-  if(S.edit && (e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'z'){
-    e.preventDefault(); undoEdit();
+  const t = e.target, tag = t && t.tagName;
+  if(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  // なおすモードの外でも効かせる。読み込みで前の形が消えたときに戻す手がこれ。
+  if((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'z'){
+    e.preventDefault(); undoEdit(); return;
+  }
+  if(e.key === 'Escape' && S.solo){
+    S.solo = null; rebuild(); renderMat(); toast('全部の素材を出した');
   }
 });
 
@@ -1168,6 +1313,11 @@ function rebuild(){
   buildMesh(S.model, { maxY:S.maxY, solo:S.solo, hidden:S.hidden, grid:S.grid, edge:S.edge });
 }
 function setModel(m, opts){
+  opts = opts || {};
+  // 入れ替える前の形を履歴に積む＝読み込みも「もどす」で戻せる。
+  // 3つの入口（絵・JSON・見本）が確認なしに全部消す、が一番痛い事故だった。
+  if(S.model && opts.history !== false) snapshot(opts.from || '入れ替え前の形');
+  else if(!S.model) HIST.length = 0;
   S.model = m;
   S.solo = null; S.hidden = new Set();
   S.maxY = m.size[1]-1;
@@ -1176,8 +1326,7 @@ function setModel(m, opts){
   sl.min = 1; sl.max = m.size[1]; sl.value = m.size[1];
   $('#sliceLab').textContent = '全層';
   rebuild();
-  if(!opts || opts.fit !== false) fitCam(m);
-  HIST.length = 0;
+  if(opts.fit !== false) fitCam(m);
   renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD(); renderEdit();
 }
 function renderHUD(){
@@ -1224,7 +1373,9 @@ function renderInfo(){
 
   $('#selSample').onchange = e=>{
     const s = SAMPLES.find(x=>x.key===e.target.value);
-    S.sampleKey = s.key; setModel(fromGrid(s));
+    S.sampleKey = s.key;
+    applyModel(fromGrid(s), '見本を出す前の形');
+    toast('見本：' + s.title + '　前の形は Ctrl+Z で戻る', 3400);
   };
   $('#selPal').onchange = e=>{
     const id = e.target.value;
@@ -1232,7 +1383,7 @@ function renderInfo(){
     const np = {};
     for(const k in S.model.palette) np[k] = src[k] || S.model.palette[k];
     S.model.palette = np; S.model.meta.paletteId = id;
-    rebuild(); renderMat(); renderInfo();
+    rebuild(); renderMat(); renderInfo(); saveSoon();
   };
 }
 
@@ -1357,6 +1508,8 @@ function renderIO(){
     </div>
     <textarea id="jsonIn" placeholder='{"format":"imasica/v0", ...} をここに貼る'></textarea>
     <button class="btn pri" id="btnLoad">読み込んで立てる</button>
+    <input type="file" id="jsonFile" accept=".json,application/json" style="margin-top:7px; font-size:12px; width:100%">
+    <div class="tiny muted" style="margin-top:3px">落としておいた .json はここから直接開ける（貼り付けなくていい）。読み込みは Ctrl+Z で取り消せる。</div>
 
     <h2 class="sec">世界にする</h2>
     <div class="tiny muted" style="margin-bottom:7px">
@@ -1385,9 +1538,10 @@ function renderIO(){
       <br><br>scale_m を書けば 1セルが何メートルかが決まり、現実の寸法にも接続できる。
     </div>
     <div class="tiny" style="margin-top:22px; padding-top:12px; border-top:1px solid var(--line); color:#5c6473">
-      IMASICA v0.3 ／ <a href="https://x.com/osakenpiro" target="_blank" rel="noopener" style="color:#6d7484">osakenpiro</a>
+      IMASICA v0.8 ／ <a href="https://x.com/osakenpiro" target="_blank" rel="noopener" style="color:#6d7484">osakenpiro</a>
       ／ #全人類UX改善計画<br>
-      データは端末の外に出ない。共有リンクは設計図そのものをURLに畳んだもの。
+      データは端末の外に出ない。共有リンクは設計図そのものをURLに畳んだもの。<br>
+      いま開いている形と世界は、この端末の中に自動で保存される。次に開くと続きから始まる。
     </div>`;
 
   renderWorld();
@@ -1395,13 +1549,23 @@ function renderIO(){
   $('#btnWorldAdd').onclick = ()=>{
     const m = S.model;
     S.world.push({ m, ...worldPlace(m), label:(m.meta.title||'名称未設定') });
-    renderWorld(); toast('世界に足した（' + S.world.length + '棟）');
+    renderWorld(); saveSoon(); toast('世界に足した（' + S.world.length + '棟）');
   };
   $('#btnWorldShow').onclick = ()=>{
     if(!S.world.length){ toast('まだ1棟も足していない'); return; }
-    setModel(mergeWorld(S.world)); toast(S.world.length + '棟の世界');
+    try{
+      const w = mergeWorld(S.world);
+      applyModel(w, '世界を見る前の形');
+      toast(S.world.length + '棟の世界' + (w.warn && w.warn.length ? '（' + w.warn.join('／') + '）' : ''),
+            w.warn && w.warn.length ? 5200 : 1900);
+    }catch(e){ toast('世界にまとめられない：' + e.message, 5200); }
   };
-  $('#btnWorldClear').onclick = ()=>{ S.world = []; renderWorld(); toast('世界を空にした'); };
+  $('#btnWorldClear').onclick = ()=>{
+    if(!S.world.length){ toast('もう空'); return; }
+    const back = S.world.slice();
+    S.world = []; renderWorld(); saveSoon();
+    toast('世界を空にした（' + back.length + '棟）。取り消すには入出力タブで足し直す', 3600);
+  };
 
   $('#btnLoad').onclick = ()=>{
     const v = $('#jsonIn').value.trim();
@@ -1409,8 +1573,22 @@ function renderIO(){
     try{
       const m = fromJSON(v);
       if(!m.data.some(k=>!AIR.has(k))){ toast('ブロックが1個も無い。layersの中身を確認'); return; }
-      setModel(m); toast('読み込んだ：' + (m.meta.title||'名称未設定'));
-    }catch(e){ toast('JSONが読めない：' + e.message, 4200); }
+      applyModel(m, '読み込み前の形');
+      toast('読み込んだ：' + (m.meta.title||'名称未設定') + '　前の形は Ctrl+Z で戻る', 3400);
+    }catch(e){ toast('JSONが読めない：' + e.message, 5200); }
+  };
+  const jf = $('#jsonFile');
+  if(jf) jf.onchange = async ()=>{
+    const f = (jf.files||[])[0];
+    if(!f) return;
+    try{
+      const txt = await f.text();
+      const m = fromJSON(txt);
+      if(!m.data.some(k=>!AIR.has(k))){ toast('ブロックが1個も無い'); return; }
+      applyModel(m, '読み込み前の形');
+      toast('読み込んだ：' + f.name + '　前の形は Ctrl+Z で戻る', 3400);
+    }catch(e){ toast('読めない：' + e.message, 5200); }
+    jf.value = '';
   };
   $('#btnShare').onclick = async ()=>{
     const packed = await packURL(toJSON(S.model,false));
@@ -1517,10 +1695,10 @@ function renderImgDict(){
     <div class="tiny muted" id="dictNote" style="margin-top:6px"></div>`;
 
   $('#imgDict').querySelectorAll('[data-col]').forEach(el=>{
-    el.oninput = ()=>{ S.model.palette[el.dataset.col].color = el.value; rebuild(); renderMat(); };
+    el.oninput = ()=>{ S.model.palette[el.dataset.col].color = el.value; rebuild(); renderMat(); saveSoon(); };
   });
   $('#imgDict').querySelectorAll('[data-nm]').forEach(el=>{
-    el.onchange = ()=>{ S.model.palette[el.dataset.nm].name = el.value; renderMat(); };
+    el.onchange = ()=>{ S.model.palette[el.dataset.nm].name = el.value; renderMat(); saveSoon(); };
   });
 
   $('#btnDictSave').onclick = ()=>{
@@ -1542,7 +1720,7 @@ function renderImgDict(){
     const d = loadDicts()[nm];
     let hit = 0;
     for(const k in d){ if(S.model.palette[k]){ S.model.palette[k] = { ...d[k] }; hit++; } else { S.model.palette[k] = { ...d[k] }; } }
-    S.tal = tally(S.model); rebuild(); renderMat(); renderImgDict(); renderInfo();
+    S.tal = tally(S.model); rebuild(); renderMat(); renderImgDict(); renderInfo(); saveSoon();
     toast('「'+nm+'」を当てた（' + hit + '色が一致）');
   };
   $('#btnDictDel').onclick = ()=>{
@@ -1604,10 +1782,17 @@ function bindImgInput(){
         title = files[0].name.replace(/\.[^.]+$/,'') + (files.length>1 ? ' ほか'+files.length+'枚' : '');
       }
       let shots;
+      const warn = [];
       if(mode === 'cross'){
         if(imgs.length < 2){ toast('交差は2枚いる（1枚目＝正面、2枚目＝側面）', 4000); return; }
-        const front = rasterize(imgs[0], cols);
-        shots = [front, rasterizeH(imgs[1], front.h)];   // 側面は正面と同じ背丈に刻む
+        let front = rasterize(imgs[0], cols);
+        if(front.h > RASTER_MAX){
+          front = rasterizeH(imgs[0], RASTER_MAX);       // 高さを先に丸めてから側面を合わせる
+          warn.push('縦長すぎたので高さ' + RASTER_MAX + 'マスに収めた（横' + front.w + 'マス）');
+        }
+        const side = rasterizeH(imgs[1], front.h);
+        if(side.h !== front.h) warn.push('側面の背丈を合わせられなかった');
+        shots = [front, side];
       } else {
         shots = imgs.map(im => rasterize(im, cols));
       }
@@ -1617,10 +1802,11 @@ function bindImgInput(){
       }, S.model.palette);
       const n = m.data.filter(k=>!AIR.has(k)).length;
       if(!n){ toast('ブロックが1個も取れなかった。白背景だけ／透明だけかも', 4000); return; }
-      if(n > 30000){ toast('ブロックが' + n + '個。重いので横のマス数を減らすと軽くなる', 4200); }
-      setModel(m);
+      if(n > 30000) warn.push('ブロック' + n + '個で重い。横のマス数を減らすと軽くなる');
+      m.warn = warn.concat(m.warn || []);
+      applyModel(m, '絵から立てる前の形');
       toast(imgs.length + (psdFile ? '層' : '枚') + 'から ' + n + 'ブロック立てた');
-    }catch(e){ toast('読めなかった：' + e.message, 4200); }
+    }catch(e){ toast('読めなかった：' + e.message, 5200); }
   };
 }
 
@@ -1644,6 +1830,8 @@ function mergeWorld(items){
     Y = Math.max(Y, (it.oy||0) + it.m.size[1]);
     Z = Math.max(Z, it.oz + it.m.size[2]);
   });
+  guardSize(X, Y, Z, '世界が');
+  let crowded = 0;
   const data = new Array(X*Y*Z).fill('.');
   const pal = {};
   const spare = Array.from({length:26}, (_,i)=> String.fromCharCode(65+i))
@@ -1658,7 +1846,8 @@ function mergeWorld(items){
       else if(pal[k].color === src.color && pal[k].name === src.name){ remap[k] = k; }
       else {
         const free = spare.find(c=>!pal[c]);
-        if(free){ pal[free] = src; remap[k] = free; } else remap[k] = k;   // 空きが尽きたら相乗り
+        if(free){ pal[free] = src; remap[k] = free; }
+        else { remap[k] = k; crowded++; }   // 記号が尽きたら相乗り。黙って色が化けるので数える
       }
     }
     const [sx,sy,sz] = it.m.size, oy = it.oy||0;
@@ -1669,11 +1858,15 @@ function mergeWorld(items){
       if(gx<X && gy<Y && gz<Z) data[(gy*Z+gz)*X+gx] = remap[k] || k;
     }
   });
-  return mkModel([X,Y,Z], data, pal, {
+  const wm = mkModel([X,Y,Z], data, pal, {
     title:'世界（' + items.length + '棟）', author:'', target:'generic', scale_m:1,
     notes:'複数の建物を1つにまとめたもの。素材リストは全棟の合計。',
     tags:['世界', items.length + '棟']
   });
+  wm.warn = crowded
+    ? ['素材の記号が足りず ' + crowded + '色が別の素材に相乗りした。棟を減らすか、色辞書で素材をそろえて']
+    : [];
+  return wm;
 }
 function renderWorld(){
   const el = $('#worldList');
@@ -1791,19 +1984,45 @@ function psdLayerToCanvas(psd, node){
   return c;
 }
 
-/* PSD → 「下から順の絵の列」。非表示レイヤーは飛ばす（下書きを消さずに渡せる）。 */
+/* 使い終わったキャンバスを畳む。
+   実寸3000×4200を60層ぶん抱えたままにすると3GB要求してタブが落ちる。
+   幅と高さに0を入れると、ブラウザは裏の画素バッファを手放す。 */
+function freeCanvas(c){ try{ c.width = 1; c.height = 1; }catch(e){} }
+function freeNode(n){
+  if(!n) return;
+  if(n.canvas) freeCanvas(n.canvas);
+  if(n.imageData) n.imageData = null;
+  (n.children || []).forEach(freeNode);
+}
+
+/* PSD → 「下から順の絵の列」。非表示レイヤーは飛ばす（下書きを消さずに渡せる）。
+   1層ずつ、実寸に焼く → 作業用の小さい絵に落とす → 実寸を畳む、の順で進める。
+   全層ぶんの実寸を同時に持たないので、大きい psd でも落ちない。 */
+/* 作業用の長辺。ここから更に「横のマス数」（最大96）まで刻まれるので、
+   512 あれば最終解像度の5倍以上。実寸を持ち続ける理由が無い。 */
+const PSD_WORK_MAX = 512;
+const PSD_INK_MIN  = 6;      // 縮めた後の絵で数えるので、閾値も小さくする（点1つの層を捨てないため）
 function psdToImages(psd, groupMode){
   const out = [];
+  const sc = Math.min(1, PSD_WORK_MAX / Math.max(psd.width, psd.height));
+  const wW = Math.max(1, Math.round(psd.width  * sc));
+  const wH = Math.max(1, Math.round(psd.height * sc));
   const walk = nodes =>{
     for(const n of nodes){
       if(n.hidden) continue;
       if(n.children && n.children.length && groupMode === 'flat'){ walk(n.children); continue; }
       const c = psdLayerToCanvas(psd, n);
-      const g = c.getContext('2d', { willReadFrequently:true });
-      const d = g.getImageData(0,0,c.width,c.height).data;
+      const w = document.createElement('canvas');
+      w.width = wW; w.height = wH;
+      const wg = w.getContext('2d', { willReadFrequently:true });
+      wg.drawImage(c, 0, 0, wW, wH);
+      freeCanvas(c);                  // 実寸はここで手放す
+      freeNode(n);                    // ag-psd が層ごとに持っている実寸も手放す
+      const d = wg.getImageData(0,0,wW,wH).data;
       let ink = 0;
-      for(let i=3; i<d.length; i+=4) if(d[i] > 8){ ink++; if(ink > 24) break; }
-      if(ink > 24) out.push({ canvas:c, name:n.name || '' });   // 空っぽのレイヤーは段にしない
+      for(let i=3; i<d.length; i+=4) if(d[i] > 8){ ink++; if(ink > PSD_INK_MIN) break; }
+      if(ink > PSD_INK_MIN) out.push({ canvas:w, name:n.name || '' });  // 空っぽのレイヤーは段にしない
+      else freeCanvas(w);
     }
   };
   walk(psd.children || []);
@@ -1814,6 +2033,10 @@ async function readPsdFile(file, groupMode){
   const ag = loadAgPsd();
   const ab = await file.arrayBuffer();
   const psd = ag.readPsd(ab, { skipCompositeImageData:true, skipThumbnail:true, skipLinkedFilesData:true });
+  if(!psd || !psd.width || !psd.height) throw new Error('psd の大きさが読めない');
+  if(psd.width * psd.height > 60000000){
+    throw new Error('画布が大きすぎる（' + psd.width + '×' + psd.height + '）。書き出しで縮めてから渡す');
+  }
   const imgs = psdToImages(psd, groupMode);
   if(!imgs.length) throw new Error('中身のあるレイヤーが1枚も無かった');
   return { psd, imgs };
@@ -1827,14 +2050,18 @@ function loadImage(file){
     im.src = URL.createObjectURL(file);
   });
 }
+const RASTER_MAX = 96;
 function rasterize(im, cols){
-  const w = Math.max(1, Math.min(cols, 96));
+  const w = Math.max(1, Math.min(cols, RASTER_MAX));
   const h = Math.max(1, Math.round(im.height * (w / im.width)));
   return rasterAt(im, w, h);
 }
-function rasterizeH(im, rows){          // 高さを合わせて刻む（交差モードで2枚の背丈を揃える）
-  const h = Math.max(1, Math.min(rows, 96));
-  const w = Math.max(1, Math.min(96, Math.round(im.width * (h / im.height))));
+/* 高さを合わせて刻む（交差モードで2枚の背丈を揃える）。
+   ここで rows を 96 に丸めていたせいで、正面が96段より高いと側面が足りず、
+   交差モードで上の方が「エラーも出ずに」消えていた。丸めるなら呼ぶ側で正面ごと丸める。 */
+function rasterizeH(im, rows){
+  const h = Math.max(1, rows|0);
+  const w = Math.max(1, Math.min(RASTER_MAX, Math.round(im.width * (h / im.height))));
   return rasterAt(im, w, h);
 }
 function rasterAt(im, w, h){
@@ -1907,6 +2134,7 @@ function imagesToModel(shots, opt, palette){
     X = Math.max(...shots.map(s=>s.w));
     Z = Math.max(...shots.map(s=>s.h));
     Y = shots.length;
+    guardSize(X,Y,Z,'絵から起こした形が');
     data = new Array(X*Y*Z).fill('.');
     shots.forEach((s, y)=>{
       for(let z=0;z<s.h;z++) for(let x=0;x<s.w;x++){
@@ -1917,6 +2145,7 @@ function imagesToModel(shots, opt, palette){
   } else if(opt.mode === 'extrude'){
     const s = shots[0];
     X = s.w; Y = s.h; Z = Math.max(1, opt.depth);
+    guardSize(X,Y,Z,'絵から起こした形が');
     data = new Array(X*Y*Z).fill('.');
     for(let py2=0;py2<s.h;py2++) for(let x=0;x<s.w;x++){
       const [r,g,b,a] = px(s,x,py2);
@@ -1927,6 +2156,7 @@ function imagesToModel(shots, opt, palette){
   } else if(opt.mode === 'cross'){                     // 正面 × 側面 の交差
     const a = shots[0], b = shots[1] || shots[0];      // a=正面(x,y)  b=側面(z,y)
     X = a.w; Y = a.h; Z = b.w;
+    guardSize(X,Y,Z,'絵から起こした形が');
     data = new Array(X*Y*Z).fill('.');
     for(let y=0;y<Y;y++){
       const ay = a.h-1-y, by = b.h-1-y;                // どちらも下端を地面に合わせる
@@ -1945,6 +2175,7 @@ function imagesToModel(shots, opt, palette){
   } else {                                             // height
     const s = shots[0];
     X = s.w; Z = s.h; Y = Math.max(1, opt.maxH);
+    guardSize(X,Y,Z,'絵から起こした形が');
     data = new Array(X*Y*Z).fill('.');
     for(let z=0;z<s.h;z++) for(let x=0;x<s.w;x++){
       const [r,g,b,a] = px(s,x,z);
@@ -2015,21 +2246,44 @@ CV.addEventListener('click', e=>{
   const rec = faceMap[hits[0].faceIndex];
   if(!rec) return;
   const p = S.model.palette[rec.k] || {name:rec.k};
-  S.solo = (S.solo === rec.k) ? null : rec.k;
+  const on = S.solo !== rec.k;
+  S.solo = on ? rec.k : null;
   rebuild(); renderMat();
-  toast(p.name + '　（' + (p.role||'') + '） ' + (S.tal.counts[rec.k]||0) + '個　' + (rec.y+1) + '段目');
+  // ここで家が消えたように見えて戻し方が分からない、が初見の最大のつまずきだった
+  toast(p.name + '　（' + (p.role||'') + '） ' + (S.tal.counts[rec.k]||0) + '個　' + (rec.y+1) + '段目'
+        + (on ? '　── 他を透かした。もう一度押すかEscで戻る' : ''), on ? 3400 : 1900);
 });
 
 /* ---------- 起動 ---------- */
 (async function boot(){
   resize(); loop();
-  let loaded = false;
+  let msg = null;
   const h = location.hash;
-  if(h && h.indexOf('#d=') === 0){
-    try{ setModel(fromJSON(await unpackURL(h.slice(3)))); loaded = true; toast('共有リンクから読み込んだ'); }
-    catch(e){ console.warn(e); toast('共有リンクが壊れている。見本を表示する', 3200); }
+
+  // 共有リンクが最優先。ただし前回の作業は消さずに履歴へ積む（Ctrl+Z で自分の形に戻れる）。
+  const saved = restoreSaved();
+  if(saved){
+    setModel(saved.m, { history:false });
+    S.world = saved.world || [];
+    renderWorld();
+    msg = '前回の続きから（' + agoText(saved.at) + '）' +
+          (S.world.length ? '　世界' + S.world.length + '棟も戻した' : '');
   }
-  if(!loaded) setModel(fromGrid(SAMPLES[0]));
+  if(h && h.indexOf('#d=') === 0){
+    try{
+      const m = fromJSON(await unpackURL(h.slice(3)));
+      setModel(m, { from: saved ? '前回の続き' : undefined, history: !!saved });
+      msg = saved
+        ? '共有リンクを開いた。前回の自分の形は Ctrl+Z で戻る'
+        : '共有リンクから読み込んだ';
+    }catch(e){
+      console.warn(e);
+      if(!saved) msg = '共有リンクが壊れている。見本を表示する';
+      else msg = '共有リンクが壊れていた。前回の続きを出している';
+    }
+  }
+  if(!S.model) setModel(fromGrid(SAMPLES[0]), { history:false });
+  if(msg) setTimeout(()=>toast(msg, 4200), 400);
   setTimeout(resize, 60);
 })();
 
