@@ -106,12 +106,14 @@
   #stage{flex:1; position:relative; min-width:0; background:#0e1015}
   #cv{display:block; width:100%; height:100%; touch-action:none}
   #hud{
-    position:absolute; left:14px; top:12px; pointer-events:none;
+    /* 左に粗さの柱が立つので、その右へ逃がす。重なると HUD が読めなくなる（実機420pxで踏んだ） */
+    position:absolute; left:74px; top:12px; pointer-events:none; max-width:calc(100% - 150px);
     font-size:12px; color:var(--dim); text-shadow:0 1px 3px #000; line-height:1.5;
   }
   #hud b{color:var(--fg); font-size:13.5px}
   #tip{
-    position:absolute; right:14px; bottom:14px; font-size:11px; color:#6d7484;
+    /* ツールバーの上・スライスの柱の左。ボタンが8個になって同じ高さでは並ばなくなった */
+    position:absolute; right:74px; bottom:60px; font-size:11px; color:#6d7484;
     text-align:right; pointer-events:none; line-height:1.6;
   }
   #slice{
@@ -123,9 +125,23 @@
     writing-mode:vertical-lr; direction:rtl;
     width:26px; flex:1; accent-color:var(--accent); cursor:pointer;
   }
+  #coarse{
+    position:absolute; left:16px; top:14px; bottom:64px; width:46px;
+    display:flex; flex-direction:column; align-items:center; gap:6px;
+  }
+  #coarse .lab{font-size:10.5px; color:var(--dim); background:rgba(18,20,26,.75); padding:1px 5px; border-radius:5px; white-space:nowrap}
+  #coarseRange{
+    writing-mode:vertical-lr; direction:rtl;
+    width:26px; flex:1; accent-color:var(--accent); cursor:pointer;
+  }
   #toolbar{
     position:absolute; left:50%; transform:translateX(-50%); bottom:14px;
-    display:flex; gap:6px; background:rgba(25,28,36,.9); border:1px solid var(--line);
+    display:flex; flex-wrap:wrap; justify-content:center; gap:6px;
+    /* ⚠ left:50% だけだと収縮幅が親の50%に頭打ちになり、ボタンが増えた瞬間に
+       勝手に折り返す（v0.7から潜んでいて、はみ出してヒント文と重なっていた）。
+       width:max-content で自然幅を取り、max-width で左右の柱を避ける。 */
+    width:max-content; max-width:calc(100% - 140px);
+    background:rgba(25,28,36,.9); border:1px solid var(--line);
     border-radius:11px; padding:5px; backdrop-filter:blur(8px);
   }
   #toolbar button{
@@ -152,6 +168,7 @@
     font-size:11.5px; padding:5px 10px; border-radius:7px; cursor:pointer;
   }
   #editbar .ebtn:hover{background:#38414f; color:var(--fg)}
+  #editbar .ebtn.on{background:#1f3a52; color:#cfe8ff; border-color:#3a6a90}
   #editbar .ehint{font-size:11px; color:#6d7484; margin-left:2px}
 
   body.editing #toast{ bottom:124px }   /* 編集バーと重ねない */
@@ -170,6 +187,10 @@
     #side{width:100%; flex:0 0 auto; max-height:52dvh; border-right:none; border-bottom:1px solid var(--line)}
     #stage{flex:1}
     #slice{top:8px; bottom:56px; width:38px}
+    #coarse{top:8px; bottom:56px; width:38px}
+    #hud{left:62px; max-width:calc(100% - 124px)}
+    #toolbar{max-width:calc(100% - 100px)}  /* 左右の柱を避ける。8個は狭い画面で溢れる */
+    #tip{display:none}                      /* 狭い画面では操作ヒントよりツールバーを優先 */
   }
 </style>
 </head>
@@ -203,12 +224,20 @@
       <input type="range" id="sliceRange" orient="vertical" min="1" max="10" value="10">
       <div class="lab">層</div>
     </div>
+    <div id="coarse">
+      <div class="lab" id="coarseLab">元の細かさ</div>
+      <input type="range" id="coarseRange" orient="vertical" min="4" max="24" value="24">
+      <div class="lab">粗さ</div>
+    </div>
     <div id="editbar"></div>
     <div id="toolbar">
       <button id="btnEdit">なおす</button>
       <button id="btnSpin">自動回転</button>
       <button id="btnGrid" class="on">グリッド</button>
       <button id="btnEdge" class="on">枠線</button>
+      <button id="btnWeight" class="on" title="消してみる。何が重さを作っていたかが分かる">重さ</button>
+      <button id="btnMat" class="on" title="外してみる。色が消えて構造だけが残る">色</button>
+      <button id="btnFloat" class="on" title="消してみる。全部が1.0に固まって、世界が完成してしまう" style="display:none">ゆらぎ</button>
       <button id="btnBuild">積み上げ再生</button>
       <button id="btnFit">全体を映す</button>
     </div>
@@ -544,11 +573,38 @@ function guardSize(X, Y, Z, what){
   }
 }
 
-function mkModel(size, data, palette, meta){
+/* 存在度（形式 v1・案D「半分ある」）
+   1セルに 0.0〜1.0 の「どれだけ確定しているか」を持たせる。
+   0.0＝無い ／ 1.0＝固い ／ 0.4＝まだ妄想し切れていない。
+   **書かなければ 1.0。**確定しているものはわざわざ書かない＝
+   presence が無いモデルは v0 とまったく同じ（後方互換はここで取れている）。 */
+const PRES_STEPS = 9;                     // 文字 0〜9 の10段階。9＝1.0＝書かないのと同じ
+function mkModel(size, data, palette, meta, pres){
   const [X,Y,Z] = size;
-  const m = { size:[X,Y,Z], data, palette, meta:meta||{} };
+  // 受け取った存在度も入口で目盛りに載せる＝「存在度は常に10段階の上にある」を不変条件にする。
+  // ここを緩めると、保存→読み込みで値が動く経路がひとつ残る。
+  if(pres){ for(let i=0;i<pres.length;i++) pres[i] = Math.round(Math.max(0, Math.min(1, pres[i])) * PRES_STEPS) / PRES_STEPS; }
+  const m = { size:[X,Y,Z], data, palette, meta:meta||{}, pres: pres || null };
   m.get = (x,y,z)=> (x<0||y<0||z<0||x>=X||y>=Y||z>=Z) ? '.' : data[(y*Z+z)*X+x];
   m.solid = (x,y,z)=> !AIR.has(m.get(x,y,z));
+  m.p = (x,y,z)=>{
+    if(!m.pres || x<0||y<0||z<0||x>=X||y>=Y||z>=Z) return 1;
+    const v = m.pres[(y*Z+z)*X+x];
+    return (v === undefined || v === null) ? 1 : v;
+  };
+  m.setP = (x,y,z,v)=>{
+    if(x<0||y<0||z<0||x>=X||y>=Y||z>=Z) return;
+    // ⚠ 10段階の目盛りに載せる。1文字で書く形式なので、載せないと
+    //    保存→読み込みで値が動く（0.30 が 0.33 になる）。目盛りが仕様。
+    v = Math.round(Math.max(0, Math.min(1, v)) * PRES_STEPS) / PRES_STEPS;
+    if(!m.pres){ if(v >= 1) return; m.pres = new Float32Array(X*Y*Z).fill(1); }
+    m.pres[(y*Z+z)*X+x] = v;
+  };
+  m.hasSoft = ()=>{
+    if(!m.pres) return false;
+    for(let i=0;i<m.pres.length;i++) if(m.pres[i] < 1 && !AIR.has(data[i])) return true;
+    return false;
+  };
   return m;
 }
 
@@ -633,7 +689,30 @@ function fromJSON(raw){
       palette[k] = { name:'未定義ブロック「'+k+'」', color:auto[ai++ % auto.length], role:ROLE[k]||'', note:'パレット未定義' };
     }
   }
-  const mm = mkModel([X,Y,Z], data, palette, meta);
+  /* 存在度（v1）。layers と同じ形の文字グリッド。文字 0〜9 → 0/9〜9/9。
+     `.` や省略は 1.0＝固い。**書いた分だけ柔らかい。** */
+  let pres = null;
+  const pl = raw.presence || (raw.voxels && raw.voxels.presence);
+  if(Array.isArray(pl) && pl.length){
+    pres = new Float32Array(X*Y*Z).fill(1);
+    let any = false;
+    pl.forEach((layer,y)=>{
+      if(y >= Y || !layer) return;
+      (Array.isArray(layer) ? layer : [layer]).forEach((row,z)=>{
+        if(z >= Z) return;
+        String(row).split('').forEach((ch,x)=>{
+          if(x >= X) return;
+          if(ch < '0' || ch > '9') return;          // `.` や空白は「書いていない」＝1.0
+          const v = (ch.charCodeAt(0) - 48) / PRES_STEPS;
+          pres[(y*Z+z)*X+x] = v;
+          if(v < 1) any = true;
+        });
+      });
+    });
+    if(!any) pres = null;
+    else if(pl.length > Y) warn.push('presence の段数が layers より多い（余りは読み飛ばした）');
+  }
+  const mm = mkModel([X,Y,Z], data, palette, meta, pres);
   mm.warn = warn;
   return mm;
 }
@@ -656,13 +735,32 @@ function toJSON(m, pretty){
   for(const k of used) if(m.palette[k]) pal[k] = {
     name:m.palette[k].name, color:m.palette[k].color, role:m.palette[k].role, note:m.palette[k].note||undefined
   };
+  // 存在度は「書いた分だけ」出す。全部 1.0 なら presence を出さず format も v0 のまま
+  // ＝既存の出力は1バイトも変わらない。
+  let presence = null;
+  if(m.hasSoft && m.hasSoft()){
+    presence = [];
+    for(let y=0;y<Y;y++){
+      const rows = [];
+      for(let z=0;z<Z;z++){
+        let t = '';
+        for(let x=0;x<X;x++){
+          const v = m.p(x,y,z);
+          t += (v >= 1 || AIR.has(m.get(x,y,z))) ? '.' : String(Math.max(0, Math.min(9, Math.round(v*PRES_STEPS))));
+        }
+        rows.push(t);
+      }
+      presence.push(rows);
+    }
+  }
   const o = {
-    format:'imasica/v0',
+    format: presence ? 'imasica/v1' : 'imasica/v0',
     meta:Object.assign({ title:'名称未設定', author:'', target:'pokopoke', scale_m:1 }, m.meta),
     size:[X,Y,Z],
     palette:pal,
     voxels:{ type:'layers', layers }
   };
+  if(presence) o.presence = presence;
   if(!pretty) return JSON.stringify(o);
   // layers は1層ずつ縦に並べたほうが人が読める
   let s = JSON.stringify(o, null, 2);
@@ -676,6 +774,59 @@ function toJSON(m, pretty){
     return t;
   });
   return s;
+}
+
+/* ==========================================================================
+   粗さ ＝ 世界のクロック（案B）
+   --------------------------------------------------------------------------
+   「1セルの中で起きたことは、この世界には存在**できない**」を、
+   消えていくディテールで見せる。粗くすると窓が消え、細かくすると窓が戻る。
+
+   元（origin）を必ず持っておき、**毎回そこから刻み直す**。
+   いまの形を続けて粗くしていくと戻れなくなる＝情報が片道で減る。
+   ・絵から立てた形 → 元の絵から刻み直す（元より細かくもできる）
+   ・それ以外       → 元のボクセルを間引く（元の細かさまでしか戻らない）
+   ========================================================================== */
+function coarsenVox(m, s){
+  if(s <= 1.0001) return m;
+  const [X,Y,Z] = m.size;
+  const nX = Math.max(1, Math.round(X/s)), nY = Math.max(1, Math.round(Y/s)), nZ = Math.max(1, Math.round(Z/s));
+  const data = new Array(nX*nY*nZ).fill('.');
+  let pres = null;
+  const sx = X/nX, sy = Y/nY, sz = Z/nZ;
+  const tally0 = {};
+  for(let y=0;y<nY;y++) for(let z=0;z<nZ;z++) for(let x=0;x<nX;x++){
+    const x0=Math.floor(x*sx), x1=Math.max(x0+1, Math.round((x+1)*sx));
+    const y0=Math.floor(y*sy), y1=Math.max(y0+1, Math.round((y+1)*sy));
+    const z0=Math.floor(z*sz), z1=Math.max(z0+1, Math.round((z+1)*sz));
+    let tot=0, solid=0;
+    for(const k in tally0) delete tally0[k];
+    for(let b=y0;b<y1 && b<Y;b++) for(let c=z0;c<z1 && c<Z;c++) for(let a=x0;a<x1 && a<X;a++){
+      tot++;
+      const k = m.get(a,b,c);
+      if(AIR.has(k)) continue;
+      solid++; tally0[k] = (tally0[k]||0)+1;
+    }
+    // 半分以上が詰まっていたら1マスにする。多数決で素材を決める。
+    // ⚠ 「1個でもあれば残す」にすると、粗くするほど太っていく（窓が消えずに壁が膨らむ）。
+    if(!tot || solid*2 < tot) continue;
+    let best=null, bn=0;
+    for(const k in tally0) if(tally0[k] > bn){ bn = tally0[k]; best = k; }
+    if(best){
+      data[(y*nZ+z)*nX+x] = best;
+      if(m.pres){
+        // 存在度は平均。粗くすると「半分ある」が薄まって混ざる＝クロックが荒いほど曖昧になる
+        let ps=0, pn=0;
+        for(let b=y0;b<y1 && b<Y;b++) for(let c=z0;c<z1 && c<Z;c++) for(let a=x0;a<x1 && a<X;a++){
+          if(AIR.has(m.get(a,b,c))) continue;
+          ps += m.p(a,b,c); pn++;
+        }
+        const pa = Math.round(ps/pn * PRES_STEPS) / PRES_STEPS;   // 目盛りに載せる
+        if(pn && pa < 1){ if(!pres) pres = new Float32Array(nX*nY*nZ).fill(1); pres[(y*nZ+z)*nX+x] = pa; }
+      }
+    }
+  }
+  return mkModel([nX,nY,nZ], data, m.palette, Object.assign({}, m.meta), pres);
 }
 
 /* ---- 集計 ---- */
@@ -869,16 +1020,30 @@ let meshMain = null, meshGhost = null, meshEdge = null, gridHelper = null;
 let faceMap = [];                       // 三角形index → {x,y,z,k}
 const raycaster = new THREE.Raycaster();
 
+/* 質量（§2）：いま画面に立っている分のブロック数と詰まり具合。
+   新しく数え直さない——buildMesh がどのみち全マスを歩くので、そのついでに拾う。
+   スライスで層を下げたり素材を隠したりすると、ここも一緒に減る＝影も一緒に軽くなる。 */
+let MASS = { blocks:0, w:0, d:0, h:0, vol:0, density:0,
+             x0:0, x1:-1, z0:0, z1:-1, mask:null, mw:0, md:0 };
+
 /* --- 6面の定義：dir と面内の2軸 --- */
 /* u × v = d になるよう組む（＝外から見て反時計回り＝表面）。
    ここを取り違えると全部の面が裏返り、建物が半透明に見える。 */
+/* s ＝ 三面の明度。面の向きだけで決める（§1）。
+   上1.00 ／ 側0.78 ／ 前後0.62 ／ 底0.45。前後を側より暗くすると奥行きが立つ。
+   ・アンビエントオクルージョンは入れない。角が丸く見えて
+     「1マスが1マスのまま」が壊れるから。1マスの輪郭は枠線が担う。
+   ・MeshBasicMaterial のままライト計算を持たない＝マス数が増えても重くならない。 */
+/* 上面の上限。1.00 は実描画で白飛びした（generic の W=#d9d2c4 が素のまま出て、
+   上面が真っ白の板になり階調が残らない）。0.94 にして上に少し空を残す。 */
+const TOP_MAX = 0.94;
 const FACES = [
-  { d:[ 1, 0, 0], u:[0,1,0], v:[0,0,1], s:0.80 },
-  { d:[-1, 0, 0], u:[0,0,1], v:[0,1,0], s:0.68 },
-  { d:[ 0, 1, 0], u:[0,0,1], v:[1,0,0], s:1.00 },
-  { d:[ 0,-1, 0], u:[1,0,0], v:[0,0,1], s:0.45 },
-  { d:[ 0, 0, 1], u:[1,0,0], v:[0,1,0], s:0.88 },
-  { d:[ 0, 0,-1], u:[0,1,0], v:[1,0,0], s:0.60 }
+  { d:[ 1, 0, 0], u:[0,1,0], v:[0,0,1], s:0.78 },   // 側面
+  { d:[-1, 0, 0], u:[0,0,1], v:[0,1,0], s:0.78 },   // 側面
+  { d:[ 0, 1, 0], u:[0,0,1], v:[1,0,0], s:TOP_MAX },// 上面：光は上から
+  { d:[ 0,-1, 0], u:[1,0,0], v:[0,0,1], s:0.45 },   // 底面：見えないが、めくれたとき用
+  { d:[ 0, 0, 1], u:[1,0,0], v:[0,1,0], s:0.62 },   // 前後面
+  { d:[ 0, 0,-1], u:[0,1,0], v:[1,0,0], s:0.62 }    // 前後面
 ];
 const QUAD = [[-1,-1],[1,-1],[1,1],[-1,1]];
 const hex2v = h => { const n = parseInt(String(h).replace('#',''),16); return [((n>>16)&255)/255, ((n>>8)&255)/255, (n&255)/255]; };
@@ -890,41 +1055,64 @@ function buildMesh(m, opt){
   const solo = opt.solo, hidden = opt.hidden || new Set();
   const pos=[], col=[], idx=[], epos=[], ecol=[];
   const gpos=[], gcol=[], gidx=[];
+  const spos=[], scol=[], sidx=[], sKey=[], sSh=[], sA=[], sPh=[];   // 半分あるセル（RGBA）
+  /* 着替え（案C）用の台帳：**面ごと**に「どの素材か」と「面の明度」を覚えておく。
+     これがあると、パレットを差し替えるとき **ジオメトリを作り直さずに色だけ塗り替えられる**。
+     34,000ブロックで rebuild は 150ms かかるが、塗り替えは 1.2ms＝アニメが回る。
+     ⚠ **頂点ごとに持ってはいけない。** 最初そうしたら push が4倍になって
+     rebuild が 149ms → 248ms に落ちた（実測）。面は必ず4頂点・枠線は必ず8頂点なので、
+     1面1レコードで足りる。展開は塗るときにやる。 */
+  const kIndex = {}, kOrder = [];
+  const kOf = k => (k in kIndex) ? kIndex[k] : (kIndex[k] = kOrder.push(k) - 1);
+  const vKey=[], vSh=[], gKey=[], gSh=[], eKey=[], eSh=[];
   faceMap = [];
   const cx=(X-1)/2, cz=(Z-1)/2;
   const vis = (x,y,z)=> m.solid(x,y,z) && y<=maxY && !hidden.has(m.get(x,y,z));
+  const pAt = (x,y,z)=> FLOATY ? m.p(x,y,z) : 1;
+  // ⚠ 隠せるのは**固い隣**だけ。半分あるセルの向こうは透けて見えるので面を消せない。
+  const hide = (x,y,z)=> vis(x,y,z) && pAt(x,y,z) >= 1;
   const edgeBudget = 90000;
   let edges = 0;
+  // ---- 質量の計数（§2）。面を作るループのついでに拾う ----
+  const mask = new Uint8Array(X*Z);      // 真上から見た接地シルエット（列に1個でもあれば1）
+  let nB = 0, bx0=1e9, bx1=-1, bz0=1e9, bz1=-1, by1=-1;
 
   for(let y=0;y<=maxY;y++) for(let z=0;z<Z;z++) for(let x=0;x<X;x++){
     const k = m.get(x,y,z);
     if(AIR.has(k) || hidden.has(k)) continue;
+    const pv = pAt(x,y,z);
+    if(pv <= 0) continue;
+    // 質量は**存在度の和**。半分しか妄想できていない家は、影も半分しか落ちない。
+    nB += pv; mask[z*X+x] = 1;
+    if(x<bx0)bx0=x; if(x>bx1)bx1=x; if(z<bz0)bz0=z; if(z>bz1)bz1=z; if(y>by1)by1=y;
     const ghost = solo && k !== solo;
     const base = hex2v((m.palette[k]||{}).color || '#999999');
-    const Ps = ghost?gpos:pos, Cs = ghost?gcol:col, Is = ghost?gidx:idx;
+    const ki = kOf(k);
+    const soft = !ghost && pv < 1;
+    const Ps = soft?spos:(ghost?gpos:pos), Cs = soft?scol:(ghost?gcol:col), Is = soft?sidx:(ghost?gidx:idx);
+    const Ks = soft?sKey:(ghost?gKey:vKey), Ss = soft?sSh:(ghost?gSh:vSh);
 
     for(const f of FACES){
       const nx=x+f.d[0], ny=y+f.d[1], nz=z+f.d[2];
-      if(vis(nx,ny,nz)) continue;                       // 隠れる面は作らない
+      if(hide(nx,ny,nz)) continue;                      // 隠れる面は作らない
       const start = Ps.length/3;
-      const ao=[];
+      const l = WEIGHT ? f.s : 1;                        // 面の向きだけ。AOで角を丸めない（§1）
       for(const [du,dv] of QUAD){
         const px = x-cx + 0.5*(f.d[0] + du*f.u[0] + dv*f.v[0]);
         const py = y    + 0.5*(f.d[1] + du*f.u[1] + dv*f.v[1]);
         const pz = z-cz + 0.5*(f.d[2] + du*f.u[2] + dv*f.v[2]);
         Ps.push(px,py,pz);
-        // 簡易AO
-        const s1 = vis(nx+du*f.u[0], ny+du*f.u[1], nz+du*f.u[2]) ? 1:0;
-        const s2 = vis(nx+dv*f.v[0], ny+dv*f.v[1], nz+dv*f.v[2]) ? 1:0;
-        const cn = vis(nx+du*f.u[0]+dv*f.v[0], ny+du*f.u[1]+dv*f.v[1], nz+du*f.u[2]+dv*f.v[2]) ? 1:0;
-        const a  = (s1&&s2) ? 0 : 3-(s1+s2+cn);
-        const l  = f.s * (0.60 + 0.40*(a/3));
-        ao.push(a);
         Cs.push(base[0]*l, base[1]*l, base[2]*l);
+        if(soft) Cs.push(pv);          // 半分あるセルは RGBA
       }
-      // AOの向きに合わせて三角形の対角を反転（縞を防ぐ）
-      if(ao[0]+ao[2] > ao[1]+ao[3]) Is.push(start,start+1,start+2, start,start+2,start+3);
-      else                          Is.push(start+1,start+2,start+3, start+1,start+3,start);
+      Ks.push(ki); Ss.push(l);        // 1面＝1レコード（4頂点ぶん）
+      if(soft){
+        sA.push(pv);
+        // たゆたいの位相はマスごとに固定（毎フレーム同じ値＝揃って点滅しない）
+        sPh.push(((x*73856093) ^ (y*19349663) ^ (z*83492791)) % 6283 / 1000);
+      }
+      // 4頂点が同色なので対角の向きは効かない。固定でよい。
+      Is.push(start,start+1,start+2, start,start+2,start+3);
       if(!ghost){ const rc = {x,y,z,k,d:f.d}; faceMap.push(rc,rc); }   // dは面の外向き＝置く方向
       // 枠線
       if(!ghost && edges < edgeBudget){
@@ -933,14 +1121,34 @@ function buildMesh(m, opt){
         for(let i=0;i<4;i++){
           const a=q[i], b=q[(i+1)%4];
           epos.push(a[0],a[1],a[2], b[0],b[1],b[2]);
-          const e = f.s*0.34;
+          const e = (WEIGHT ? f.s : 1) * 0.34 * pv;   // 薄いセルは輪郭も薄い
           ecol.push(base[0]*e,base[1]*e,base[2]*e, base[0]*e,base[1]*e,base[2]*e);
           edges++;
         }
+        eKey.push(ki); eSh.push((WEIGHT ? f.s : 1) * 0.34);   // 1面＝1レコード（8頂点ぶん）
       }
     }
   }
-  [meshMain, meshGhost, meshEdge].forEach(o=>{ if(o){ world.remove(o); o.geometry.dispose(); } });
+  // ---- 質量を確定（§2）----
+  // 分母は「立っている列の数 × 全体の高さ」。
+  // ⚠ 最初は外接箱（w×d×h）で割っていたが、**世界モード（複数棟）で壊れた**：
+  //    棟と棟のあいだの空地まで分母に入り、8棟の町が density 0.15 ＝どの棟も
+  //    ぼんやりした薄い影になる。町は空気だらけなので、外接箱では必ずそうなる。
+  //    → 1マスも建っていない列を分母から外す。空気で薄めない。
+  // 「列ごとの最高点まで」にしないのは、それだと中空の家がほぼ 1.00 に張り付いて
+  //  「がらんどう」を検出できなくなるから（完了条件が壊れる）。高さは全体で採る。
+  {
+    const w = bx1<0 ? 0 : bx1-bx0+1, d = bz1<0 ? 0 : bz1-bz0+1, h = by1+1;
+    let cols = 0;
+    for(let i=0;i<mask.length;i++) if(mask[i]) cols++;
+    const vol = cols*h;
+    nB = Math.round(nB * 100) / 100;      // 存在度の和なので端数が出る。丸めてから配る
+    MASS = { blocks:nB, w, d, h, vol, cols,
+             density: vol ? Math.min(1, nB/vol) : 0,
+             x0:bx0, x1:bx1, z0:bz0, z1:bz1, mask, mw:X, md:Z };
+  }
+
+  [meshMain, meshGhost, meshEdge, meshSoft].forEach(o=>{ if(o){ world.remove(o); o.geometry.dispose(); } });
 
   const mk = (p,c,i,mat)=>{
     const g = new THREE.BufferGeometry();
@@ -955,6 +1163,17 @@ function buildMesh(m, opt){
     meshGhost = mk(gpos,gcol,gidx, new THREE.MeshBasicMaterial({ vertexColors:true, transparent:true, opacity:0.10, depthWrite:false }));
     world.add(meshGhost);
   } else meshGhost = null;
+  if(spos.length){
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(spos,3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(scol,4));   // itemSize 4 で three が alpha を見る
+    g.setIndex(sidx);
+    meshSoft = new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      vertexColors:true, transparent:true, depthWrite:false, side:THREE.DoubleSide
+    }));
+    meshSoft.renderOrder = 3;
+    world.add(meshSoft);
+  } else meshSoft = null;
   if(epos.length && opt.edge !== false){
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(epos,3));
@@ -963,12 +1182,344 @@ function buildMesh(m, opt){
     world.add(meshEdge);
   } else meshEdge = null;
 
+  // 着替えの台帳を確定（案C）。頂点index → 素材index ／ 面の明度。
+  PAINT = {
+    keys: kOrder,
+    main : meshMain  ? { m:meshMain,  k:Uint16Array.from(vKey), s:Float32Array.from(vSh), per:4 } : null,
+    soft : meshSoft  ? { m:meshSoft,  k:Uint16Array.from(sKey), s:Float32Array.from(sSh), per:4,
+                         rgba:true, a:Float32Array.from(sA), ph:Float32Array.from(sPh) } : null,
+    ghost: meshGhost ? { m:meshGhost, k:Uint16Array.from(gKey), s:Float32Array.from(gSh), per:4 } : null,
+    edge : meshEdge  ? { m:meshEdge,  k:Uint16Array.from(eKey), s:Float32Array.from(eSh), per:8 } : null
+  };
+  wearStop(); WEAR.cur = {};   // 途中だった着替えは、形が変わった時点で無効
+  if(!MATCOLOR) paintFrom({}); // 色を外している最中に形が変わったら、塗り直して合わせる
+
+  /* 沈み込み（§3）。質量に応じて grid 面より 0〜0.06 セルだけ下げる。
+     見えるか見えないかの量だが、影と組むと「置いてある」から「載っている」に変わる。
+     ⚠ 0.1セル以上下げると床にめり込んで見える。0.06 を超えない。
+     下がるのは物だけ——床（グリッド）と影は下げない。 */
+  const sink = WEIGHT
+    ? 0.06 * Math.max(0, Math.min(1, Math.log10(Math.max(1, nB)/500) / Math.log10(20)))
+    : 0;
+  [meshMain, meshGhost, meshEdge, meshSoft].forEach(o=>{ if(o) o.position.y = -sink; });
+
   if(gridHelper){ world.remove(gridHelper); gridHelper.geometry.dispose(); }
   const gs = Math.max(X,Z) + 6;
   gridHelper = new THREE.GridHelper(gs, gs, 0x3a4250, 0x232a36);
   gridHelper.position.y = -0.5;
   gridHelper.visible = opt.grid !== false;
   world.add(gridHelper);
+
+  buildShadow(cx, cz);
+}
+
+/* ==========================================================================
+   接地影 ＝ 質量（§2 本体）
+   --------------------------------------------------------------------------
+   一般的なボクセルの陰影ではなく、**この形が何マスでできているか**を影に出す。
+   同じ外形でも、6120ブロックの塊は546ブロックの塊より濃く硬い影を落とす。
+
+     濃さ   alpha  = 0.18 + 0.42 * density      詰まっているほど濃い
+     ぼけ   blur   = 6 + 18 * (1 - density)     詰まっているほど輪郭が硬い
+     広がり spread = 1 + 0.25 * log10(mass/500) 500ブロックを基準に対数で
+
+   対数なのは 546 と 6120 が11倍違うから。線形だと軽いほうの影がほぼ消える。
+   ジオメトリは増やさない——PlaneGeometry 1枚に canvas で焼いたテクスチャを貼る。
+   ========================================================================== */
+const SHADOW_PX = 8;                 // 1マスあたりのテクセル数。blur の px はこの尺度で読む
+const SHADOW_MAXPX = 768;            // テクスチャの上限（超えたら SHADOW_PX を落とす）
+/* 光だまり（実描画で足した）。
+   影は「光を遮った跡」なので、床に光が無いと影は原理的に見えない。
+   背景 #0e1015 に黒を重ねても消せる明るさが5/255しかなく、実際 5.5倍に
+   増感しないと影が読めなかった。そこで床に光を1枚置く。
+   ・光は上から（§1の前提）＝真下の床が明るいのは筋が通る
+   ・光だまりは質量に依らない定数。**変わるのは影だけ**＝読めた差は全部ブロック数の差
+   ・**光も影もグリッド線より下に敷く**。1周目は影を線より上に置いたら、
+     密度1.00の影が線を完全に食った（＝床の1マスの目盛りが消えた）。
+     グリッドはこの道具の物差しなので、影に食わせない。線は不透明なので
+     深度テストで自動的に手前に抜ける。 */
+/* 光だまりは「床に当たっている光」そのもの。**シルエットの形をしていない**——
+   1周目でシルエット型にしたら、物のきわが一番明るくなって「箱が光っている」ように
+   見えた。実際は逆で、きわは一番暗い（影が濃い）ところ。だから光は素直な円い
+   広がりにして、そこから影が抜く。
+   強さ・広さとも質量に依らない定数＝**読めた差は全部ブロック数の差**。
+   POOL_A はグリッド線（#3a4250=58,66,80）を食わない上限で決めてある。 */
+const POOL_A = 0.30;
+const POOL_C = [0x5a/255, 0x60/255, 0x70/255];
+const POOL_EXT = [6, 16];            // 足元から外へ何マス照らすか（下限・上限）
+const shadow = { mesh:null, pool:null, tex:null, ptex:null };
+
+/* 重さ（§4）。OFF にすると 影・光だまり・沈み込み・三面の明度 が同時に消える。
+   消した瞬間に立体が紙細工に見える＝何が重さを作っていたかが説明文なしで分かる。 */
+let WEIGHT = true;
+
+/* ゆらぎ（案D）。存在度 1.0 未満のセルを、薄く・たゆたわせて描く。
+   OFF にすると **全部を 1.0 に固める**＝揺れが止まり、世界が完成してしまう。
+   Visionium＝叶い切らないことが幸福の条件、を画面の上に置く。 */
+let FLOATY = true;
+let meshSoft = null;
+
+function shadowParams(M){
+  const density = Math.max(0, Math.min(1, M.density));
+  return {
+    density,
+    alpha : 0.18 + 0.42 * density,
+    blurPx: 6 + 18 * (1 - density),
+    /* ⚠ 設計値は素の log10 だったが、実描画で 500個を下回るモデル（見本の民家＝165個）が
+       spread 0.88 になり、影が輪郭の内側に縮んで物の下に完全に隠れた＝主役が出ない。
+       上からの光では影が輪郭より小さくなることはないので 1.0 で床を張る。
+       軽い側の差は 濃さ と ぼけ が持つ（広がりは重い側だけの担当）。 */
+    spread: 1 + 0.25 * Math.max(0, Math.log10(Math.max(1, M.blocks) / 500))
+  };
+}
+
+/* 箱ぼかしを3回かけるとガウスに十分近い。依存ライブラリなし・O(画素数)。
+   ctx.filter='blur()' を使わないのは、Safari で効かない環境があるため。 */
+function blurA(a, w, h, r, times){
+  r = Math.max(0, Math.round(r));
+  if(r < 1) return a;
+  const n = 2*r + 1, tmp = new Float32Array(a.length);
+  for(let t = times||3; t > 0; t--){
+    for(let y=0;y<h;y++){                       // 横
+      const o = y*w;
+      let sum = 0;
+      for(let i=-r;i<=r;i++) sum += a[o + Math.min(w-1, Math.max(0, i))];
+      for(let x=0;x<w;x++){
+        tmp[o+x] = sum/n;
+        sum += a[o + Math.min(w-1, x+r+1)] - a[o + Math.max(0, x-r)];
+      }
+    }
+    for(let x=0;x<w;x++){                       // 縦
+      let sum = 0;
+      for(let i=-r;i<=r;i++) sum += tmp[Math.min(h-1, Math.max(0, i))*w + x];
+      for(let y=0;y<h;y++){
+        a[y*w+x] = sum/n;
+        sum += tmp[Math.min(h-1, y+r+1)*w + x] - tmp[Math.max(0, y-r)*w + x];
+      }
+    }
+  }
+  return a;
+}
+
+function clearShadow(){
+  ['mesh','pool'].forEach(k=>{
+    if(shadow[k]){ world.remove(shadow[k]); shadow[k].geometry.dispose(); shadow[k].material.dispose(); shadow[k] = null; }
+  });
+  ['tex','ptex'].forEach(k=>{ if(shadow[k]){ shadow[k].dispose(); shadow[k] = null; } });
+}
+
+function buildShadow(cx, cz){
+  const M = MASS;
+  clearShadow();
+  if(!WEIGHT || !M.blocks || M.x1 < 0) return;
+
+  const P = shadowParams(M);
+  const blurCells = P.blurPx / SHADOW_PX;
+  // 光だまりの半径（定数側）。足元から外へ何マス照らすか。
+  const ext = Math.max(POOL_EXT[0], Math.min(POOL_EXT[1], Math.max(M.w, M.d) * 0.55));
+  const poolBlur = ext * 1.15;
+
+  // にじみ代。影のぼけ3σ＋広がりのはみ出し と 光だまりのぼけ の大きいほう。
+  // 足りないと影／光が四角く切れる。
+  const grow = Math.max(M.w, M.d) * (P.spread - 1) / 2;
+  const pad  = Math.ceil(Math.max(blurCells * 3 + Math.max(0, grow), poolBlur * 1.6)) + 1;
+
+  const cellsW = M.w + pad*2, cellsD = M.d + pad*2;
+  let px = SHADOW_PX;
+  while(Math.max(cellsW, cellsD) * px > SHADOW_MAXPX && px > 1) px = Math.floor(px/2) || 1;
+  const W = Math.max(4, Math.round(cellsW*px)), H = Math.max(4, Math.round(cellsD*px));
+  const mcx = (M.x0 + M.x1)/2 + 0.5, mcz = (M.z0 + M.z1)/2 + 0.5;  // 格子座標での中心
+
+  /* 接地シルエットを spread 倍して焼き、blur 分ぼかす。影も光も同じ型から出す。 */
+  const bake = (spread, blurC)=>{
+    const a = new Float32Array(W*H);
+    const inv = 1 / spread;
+    for(let j=0;j<H;j++){
+      // テクセル → 格子座標。canvas の row0 は three の v=1 ＝ world -Z 側 ＝ z の小さいほう。
+      const zs = mcz + (((M.z0 - pad) + (j + 0.5)/px) - mcz) * inv;
+      const zi = Math.floor(zs);
+      if(zi < 0 || zi >= M.md) continue;
+      const row = zi*M.mw, o = j*W;
+      for(let i=0;i<W;i++){
+        const xs = mcx + (((M.x0 - pad) + (i + 0.5)/px) - mcx) * inv;
+        const xi = Math.floor(xs);
+        if(xi < 0 || xi >= M.mw) continue;
+        if(M.mask[row + xi]) a[o+i] = 1;
+      }
+    }
+    return blurA(a, W, H, blurC * px / 2);
+  };
+
+  const mkTex = (a, paint)=>{
+    const cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const g = cv.getContext('2d');
+    const img = g.createImageData(W, H);
+    for(let i=0;i<W*H;i++) paint(img.data, i*4, Math.min(1, a[i]));
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(cv);
+    t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+    t.generateMipmaps = false;
+    if(THREE.SRGBColorSpace) t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  };
+
+  const geo = ()=> new THREE.PlaneGeometry(cellsW, cellsD);
+  const put = (mesh, y, order)=>{
+    mesh.rotation.x = -Math.PI/2;
+    // world 座標：マス x の中心は x-cx。焼いた領域の中心は (x0+x1)/2。
+    mesh.position.set((M.x0 + M.x1)/2 - cx, y, (M.z0 + M.z1)/2 - cz);
+    mesh.renderOrder = order;
+    world.add(mesh);
+    return mesh;
+  };
+
+  // --- 光だまり：グリッド線より下。加算＝床に光を足す ---
+  // ⚠ 楕円1個にしていたが、**世界モード（複数棟）で壊れた**：楕円の中心＝棟のない空地が
+  //    一番明るく、隅の棟が減衰域に落ちる＝明るさが建物と無関係に配置で決まる。
+  //    → 接地シルエットを **ext マス分ぼかしたもの** を光にする。散らばった配置にも追随する。
+  // 1周目の「箱が光って見える」失敗には戻らない。あれは ぼかしが 2.5マスと小さくて
+  // シルエットのきわに細い明るいリングが立ったから。ext（6〜16マス）まで広げると
+  // 内側は飽和し、明るさは足元から外へなだらかに落ちる。
+  // ⚠ **二値のシルエットからしか作らない**（ブロック数を混ぜない）＝
+  //    同じ外形なら光は必ず同じ。変わるのは影だけ＝読めた差は全部ブロック数の差。
+  const poolA = bake(1.0, poolBlur);
+  {
+    // 大きくぼかすと山が低くなる（小さい建物ほど低い）ので、ピークを1に揃える。
+    // 揃えないと「小さい家の足元だけ暗い」が起きて、大きさが重さに化ける。
+    let mx = 0;
+    for(let i=0;i<poolA.length;i++) if(poolA[i] > mx) mx = poolA[i];
+    if(mx > 0.001){ const k = 1/mx; for(let i=0;i<poolA.length;i++) poolA[i] = Math.min(1, poolA[i]*k); }
+  }
+  shadow.ptex = mkTex(poolA, (d,o,v)=>{
+    d[o]   = Math.round(255 * POOL_C[0]);
+    d[o+1] = Math.round(255 * POOL_C[1]);
+    d[o+2] = Math.round(255 * POOL_C[2]);
+    d[o+3] = Math.round(255 * v * POOL_A);
+  });
+  shadow.pool = put(new THREE.Mesh(geo(), new THREE.MeshBasicMaterial({
+    map: shadow.ptex, transparent:true, depthWrite:false,
+    blending: THREE.AdditiveBlending, side: THREE.DoubleSide
+  })), -0.5 - 0.020, 1);
+
+  // --- 影：光だまりの上・グリッド線の下。光を抜く ---
+  shadow.tex = mkTex(bake(P.spread, blurCells), (d,o,v)=>{
+    d[o+3] = Math.round(255 * v * P.alpha);            // RGB は 0 のまま＝黒
+  });
+  shadow.mesh = put(new THREE.Mesh(geo(), new THREE.MeshBasicMaterial({
+    map: shadow.tex, transparent:true, depthWrite:false, color:0x000000, side: THREE.DoubleSide
+  })), -0.5 - 0.010, 2);
+}
+
+/* ==========================================================================
+   着替える ＝ 同じ形・別の素材（案C）
+   --------------------------------------------------------------------------
+   構造とパレットは別の層。**形は1ビットも動かないのに別の建物になる**。
+   だから切替は「作り直す」のではなく「塗り替える」——buildMesh が置いていった
+   台帳（頂点→素材／面の明度）を使って色バッファだけ書き換える。
+
+   ・**クロスフェードにしない。素材ごとに時間差で変わる。**
+     少ない素材から先に、**多い素材ほど遅れて**変わる＝変化の順番そのものが
+     「この建物が何でできているか」になる。数字を読まなくても分かる。
+   ・「消してみる」＝**色を外す**。全部が同じ無彩色になり、構造だけが残る。
+     三面の明度は生きているので立体は保たれる＝形と素材が別物だと目で分かる。
+   ========================================================================== */
+let PAINT = null;
+let MATCOLOR = true;                       // false ＝ 色を外した状態
+const MONO = [0xd7/255, 0xd9/255, 0xde/255];
+const WEAR = { cur:{}, raf:0 };
+
+function palRGB(k){
+  if(!MATCOLOR) return MONO;
+  const p = S.model && S.model.palette ? S.model.palette[k] : null;
+  return hex2v(p ? p.color : '#999999');
+}
+/* 色バッファだけ書き換える。ジオメトリは触らない＝34,000ブロックでも回る。 */
+function paintFrom(map){
+  if(!PAINT) return;
+  const rgb = PAINT.keys.map(k => map[k] || palRGB(k));
+  ['main','soft','ghost','edge'].forEach(n=>{
+    const t = PAINT[n]; if(!t || !t.m.geometry.getAttribute('color')) return;
+    const at = t.m.geometry.getAttribute('color'), arr = at.array;
+    const K = t.k, SH = t.s, per = t.per, A = t.a;
+    let o = 0;
+    for(let i=0;i<K.length;i++){
+      const c = rgb[K[i]], sh = SH[i];
+      const r = c[0]*sh, g = c[1]*sh, b = c[2]*sh;
+      for(let j=0;j<per;j++){
+        arr[o++] = r; arr[o++] = g; arr[o++] = b;
+        if(t.rgba) arr[o++] = A ? A[i] : 1;
+      }
+    }
+    at.needsUpdate = true;
+  });
+}
+function wearStop(){ if(WEAR.raf) cancelAnimationFrame(WEAR.raf); WEAR.raf = 0; }
+
+/* ⚠ **切替の前に今の色を控える。** 1周目はここで詰まった——applyPalette が先に
+   S.model.palette を差し替えてから wearTo を呼んでいたので、`from` も `to` も
+   新しい色になり、**アニメが「新→新」を補間して何も起きなかった**（実測 進捗0%）。
+   状態を書き換える前に必ず wearSnapshot() を取る。 */
+function wearSnapshot(){
+  const f = {};
+  if(PAINT) PAINT.keys.forEach(k => f[k] = (WEAR.cur[k] || palRGB(k)).slice());
+  return f;
+}
+function wearTarget(){
+  const t = {};
+  if(PAINT) PAINT.keys.forEach(k => t[k] = palRGB(k).slice());
+  return t;
+}
+function wearTo(target, from0){
+  if(!PAINT || !PAINT.keys.length){ paintFrom(target||{}); return; }
+  const keys = PAINT.keys.slice();
+  const counts = (S.tal && S.tal.counts) || {};
+  /* 少ない素材が先、多い素材が最後。
+     ⚠ **順位（1番目/11番目…）で割ってはいけない。** 最初そうしたら、11素材のうち
+     7つが数個しかない飾りで、**最初の500msは画面がほぼ静止して見えた**（実測）。
+     時間は「見えている面積」に配るべきなので、**最多素材に対する個数比**で遅らせる。
+     数個の素材はほぼ同時に、壁や屋根は目で追える間隔で変わる。 */
+  let mx = 1;
+  keys.forEach(k => { if((counts[k]||0) > mx) mx = counts[k]; });
+  const rank = {};
+  keys.forEach(k => rank[k] = (counts[k]||0)/mx);
+  const from = {};
+  keys.forEach(k => from[k] = (from0 && from0[k]) ? from0[k].slice() : (WEAR.cur[k] || palRGB(k)).slice());
+  const SPREAD = 620, DUR = 320, TOTAL = SPREAD + DUR;
+  const t0 = performance.now();
+  wearStop();
+  const step = now=>{
+    const el = now - t0, map = {};
+    for(const k of keys){
+      let u = (el - rank[k]*SPREAD) / DUR; u = u < 0 ? 0 : (u > 1 ? 1 : u);
+      const e = 1 - Math.pow(1-u, 3);
+      const a = from[k], b = target[k] || a;
+      map[k] = [a[0]+(b[0]-a[0])*e, a[1]+(b[1]-a[1])*e, a[2]+(b[2]-a[2])*e];
+    }
+    WEAR.cur = map;
+    paintFrom(map);
+    WEAR.raf = el < TOTAL ? requestAnimationFrame(step) : 0;
+  };
+  WEAR.raf = requestAnimationFrame(step);
+}
+/* パレットを差し替える。形は作り直さない。 */
+function applyPalette(id){
+  const src = (PALETTES[id] || {}).p;
+  if(!src) return;
+  const from = wearSnapshot();               // 差し替える**前**に控える
+  const np = {};
+  for(const k in S.model.palette) np[k] = src[k] || S.model.palette[k];
+  S.model.palette = np;
+  S.model.meta.paletteId = id;
+  wearTo(wearTarget(), from);
+  renderMat(); renderInfo(); saveSoon();
+}
+/* 色を外す／着せ直す */
+function toggleMatColor(){
+  const from = wearSnapshot();               // フラグを倒す**前**に控える
+  MATCOLOR = !MATCOLOR;
+  wearTo(wearTarget(), from);
+  return MATCOLOR;
 }
 
 /* --- カメラ操作（依存ライブラリなし） --- */
@@ -1046,16 +1597,33 @@ function resize(){
 addEventListener('resize', resize);
 
 let spinning = false;
-function loop(){
+const SOFT_ANIM_MAX = 30000;     // これを超える面数ではたゆたわせない（毎フレーム書くので）
+/* たゆたい＝「まだ手を伸ばしている途中」。書き換えるのは alpha だけ。
+   位相はマスごとに固定なので、全部が揃って点滅せず、水面のように散らばって揺れる。 */
+function tickSoft(tsec){
+  const t = PAINT && PAINT.soft;
+  if(!t || !FLOATY) return;
+  const n = t.a.length;
+  if(!n || n > SOFT_ANIM_MAX) return;
+  const at = t.m.geometry.getAttribute('color'), arr = at.array;
+  let o = 3;
+  for(let i=0;i<n;i++){
+    const a = t.a[i] * (0.74 + 0.26 * Math.sin(tsec * 1.6 + t.ph[i]));
+    for(let j=0;j<4;j++){ arr[o] = a; o += 4; }
+  }
+  at.needsUpdate = true;
+}
+function loop(now){
   requestAnimationFrame(loop);
   if(spinning){ cam.th += 0.0038; applyCam(); }
+  tickSoft((now || 0) / 1000);
   renderer.render(scene, camera);
 }
 
 /* ==========================================================================
    UI
    ========================================================================== */
-const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null, dirty:false };
+const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null, dirty:false, origin:null, hard:1 };
 const $ = s => document.querySelector(s);
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -1164,8 +1732,8 @@ function markSaved(){
 }
 
 /* 人の意図で形が入れ替わる時だけ通す口。ここを通ると保存され、Ctrl+Z で前の形に戻れる。 */
-function applyModel(m, label){
-  setModel(m, { from: label || '入れ替え前の形' });
+function applyModel(m, label, origin){
+  setModel(m, { from: label || '入れ替え前の形', origin: origin });
   saveSoon();
   if(m.warn && m.warn.length) setTimeout(()=>toast('読めたが注意：' + m.warn.join(' ／ '), 5200), 900);
 }
@@ -1186,6 +1754,7 @@ function histTrim(){
 function snapshot(label){
   HIST.push({
     size: S.model.size.slice(), data: S.model.data.slice(),
+    pres: S.model.pres ? S.model.pres.slice() : null,
     palette: S.model.palette, meta: S.model.meta, label: label || ''
   });
   histTrim();
@@ -1195,7 +1764,7 @@ function undoEdit(){
   if(!HIST.length){ toast('もどせる操作がない'); return; }
   const h = HIST.pop();
   const resized = h.size.join() !== S.model.size.join();
-  S.model = mkModel(h.size, h.data, h.palette || S.model.palette, h.meta || S.model.meta);
+  S.model = mkModel(h.size, h.data, h.palette || S.model.palette, h.meta || S.model.meta, h.pres);
   afterEdit();
   if(resized){ renderPlan(); renderImg(); fitCam(S.model); }
   renderEdit();
@@ -1213,7 +1782,14 @@ function growFor(x, y, z){
   for(let yy=0; yy<Y; yy++) for(let zz=0; zz<Z; zz++) for(let xx=0; xx<X; xx++){
     nd[((yy+oy)*nZ + (zz+oz))*nX + (xx+ox)] = m.data[(yy*Z+zz)*X+xx];
   }
-  S.model = mkModel([nX,nY,nZ], nd, m.palette, m.meta);
+  let np = null;
+  if(m.pres){
+    np = new Float32Array(nX*nY*nZ).fill(1);
+    for(let yy=0; yy<Y; yy++) for(let zz=0; zz<Z; zz++) for(let xx=0; xx<X; xx++){
+      np[((yy+oy)*nZ + (zz+oz))*nX + (xx+ox)] = m.pres[(yy*Z+zz)*X+xx];
+    }
+  }
+  S.model = mkModel([nX,nY,nZ], nd, m.palette, m.meta, np);
   return [x+ox, y+oy, z+oz];
 }
 
@@ -1221,6 +1797,7 @@ function setCell(x, y, z, k){
   const m = S.model, [X,Y,Z] = m.size;
   if(x<0||y<0||z<0||x>=X||y>=Y||z>=Z) return false;
   m.data[(y*Z+z)*X+x] = k;
+  m.setP(x, y, z, AIR.has(k) ? 1 : (S.hard == null ? 1 : S.hard));   // 置くときの「かたさ」
   return true;
 }
 
@@ -1232,6 +1809,9 @@ function afterEdit(){
   if(wasAll || S.maxY > Y-1){ S.maxY = Y-1; sl.value = Y; $('#sliceLab').textContent = '全層'; }
   S.tal = tally(S.model);
   if(S.solo && !S.tal.counts[S.solo]) S.solo = null;
+  // なおした形がその形の「元」になる。粗さを戻したときに編集が消えないように。
+  S.origin = { kind:'vox', m: S.model };
+  syncCoarse();
   rebuild(); renderMat(); renderInfo(); renderHUD();
   saveSoon();
 }
@@ -1271,6 +1851,8 @@ function doEdit(cx, cy, button, alt){
   toast('置いた：' + nm(S.brush) + '　' + (p[1]+1) + '段目');
 }
 
+/* 置くときの「かたさ」＝存在度（案D）。固いものだけで作らなくていい。 */
+const HARDS = [[1,'固い','9/9＝確定した形'], [5/9,'なかば','5/9＝まだ迷っている'], [2/9,'うすい','2/9＝妄想し切れていない']];
 function renderEdit(){
   const bar = $('#editbar'), btn = $('#btnEdit');
   bar.classList.toggle('on', !!S.edit);
@@ -1288,8 +1870,13 @@ function renderEdit(){
   bar.innerHTML =
     keys.map(k=>`<button class="sw ${k===S.brush?'on':''}" data-b="${esc(k)}" title="${esc(P[k].name)}" style="background:${P[k].color}"></button>`).join('')
     + `<span class="ehint" style="margin:0 8px 0 4px;color:var(--fg)">${esc((P[S.brush]||{}).name || S.brush)}</span>`
-    + `<button class="ebtn" id="btnUndo">もどす</button>`
+    + `<span class="ehint" style="margin-left:10px">かたさ</span>`
+    + HARDS.map(h=>`<button class="ebtn hd ${S.hard===h[0]?'on':''}" data-h="${h[0]}" title="${esc(h[2])}">${esc(h[1])}</button>`).join('')
+    + `<button class="ebtn" id="btnUndo" style="margin-left:10px">もどす</button>`
     + `<span class="ehint">押す＝置く　右クリック＝消す　Alt＋押す＝色を取る</span>`;
+  bar.querySelectorAll('[data-h]').forEach(el=>{
+    el.onclick = ()=>{ S.hard = +el.dataset.h; renderEdit(); };
+  });
   bar.querySelectorAll('[data-b]').forEach(el=>{
     el.onclick = ()=>{ S.brush = el.dataset.b; renderEdit(); };
   });
@@ -1308,9 +1895,54 @@ addEventListener('keydown', e=>{
   }
 });
 
+/* ---------- 粗さ（案B）の操作 ---------- */
+const COARSE_MIN = 4, COARSE_IMG_MAX = 64;
+function coarseRange(){
+  const o = S.origin;
+  if(!o) return null;
+  if(o.kind === 'img') return { min:6, max:COARSE_IMG_MAX, now:(S.model?S.model.size[0]:o.cols) };
+  const w = o.m.size[0];
+  return { min:Math.min(COARSE_MIN, w), max:w, now:(S.model?S.model.size[0]:w) };
+}
+function syncCoarse(){
+  const r = coarseRange(), el = $('#coarseRange'), box = $('#coarse');
+  if(!r || r.max <= r.min){ box.style.display = 'none'; return; }
+  box.style.display = '';
+  el.min = r.min; el.max = r.max;
+  el.value = Math.max(r.min, Math.min(r.max, r.now));
+  labelCoarse(+el.value, r.max);
+}
+function labelCoarse(v, max){
+  // 縦の柱の上に載るので短く。意味は下の「粗さ」と title が持つ。
+  $('#coarseLab').textContent = (v >= max) ? '元' : (v + 'マス');
+  $('#coarseRange').title = '世界のクロック＝横が何マス（いま ' + v + '）。'
+    + (S.origin && S.origin.kind === 'img' ? '右へ動かすと元の絵から細かく刻み直す' : '右端＝元の細かさ');
+}
+/* 元から刻み直す。いまの形を続けて粗くしない＝往復できる。 */
+function applyCoarse(w){
+  const o = S.origin;
+  if(!o) return;
+  let m, origin = o;
+  try{
+    if(o.kind === 'img'){
+      const r = shotsFrom(o.imgs, o.mode, w);
+      m = imagesToModel(r.shots, { mode:o.mode, colorMode:o.colorMode, maxColors:10,
+                                   depth:o.extra, maxH:o.extra, title:o.title }, o.palette);
+      origin = Object.assign({}, o, { cols:w });
+    } else {
+      m = coarsenVox(o.m, o.m.size[0] / w);
+    }
+  }catch(e){ toast('刻み直せなかった：' + e.message, 4200); return; }
+  const n = m.data.filter(k=>!AIR.has(k)).length;
+  if(!n){ toast('この粗さだとブロックが1個も残らない', 3000); return; }
+  setModel(m, { history:false, fit:false, origin: origin });
+  saveSoon();
+}
+
 /* ---------- 再描画 ---------- */
 function rebuild(){
   buildMesh(S.model, { maxY:S.maxY, solo:S.solo, hidden:S.hidden, grid:S.grid, edge:S.edge });
+  renderHUD();      // スライスや非表示で「いま立っている質量」が動くので、数字も一緒に動かす
 }
 function setModel(m, opts){
   opts = opts || {};
@@ -1319,20 +1951,64 @@ function setModel(m, opts){
   if(S.model && opts.history !== false) snapshot(opts.from || '入れ替え前の形');
   else if(!S.model) HIST.length = 0;
   S.model = m;
+  // 粗さ（案B）の「元」。指定が無ければ、この形自身がいちばん細かい版。
+  S.origin = opts.origin || { kind:'vox', m: m };
+  if(!S.origin.refW) S.origin.refW = (S.origin.kind === 'img' ? S.origin.cols : S.origin.m.size[0]);
+  /* 世界のクロックを変えても**物の実寸は変わらない**。
+     刻みが粗くなったぶん1マスを大きく見せる＝見かけの大きさが揃い、
+     「同じ建物が粗い世界ではこう写る」が並べて読める。
+     ⚠ これが無いと、粗くするたびに物が小さくなって「遠ざかった」ようにしか見えない（実描画で判明）。 */
+  world.scale.setScalar((S.origin.refW || m.size[0]) / m.size[0]);
   S.solo = null; S.hidden = new Set();
   S.maxY = m.size[1]-1;
   S.tal = tally(m);
   const sl = $('#sliceRange');
   sl.min = 1; sl.max = m.size[1]; sl.value = m.size[1];
   $('#sliceLab').textContent = '全層';
+  syncCoarse();
   rebuild();
   if(opts.fit !== false) fitCam(m);
   renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD(); renderEdit();
 }
+/* 数値変化はカウントアップで出す（正典）。スライダーを引いている間も追従する。 */
+const _cnt = new WeakMap();
+function countTo(el, to, dp){
+  if(!el) return;
+  const fmt = v => dp ? v.toFixed(dp) : Math.round(v).toLocaleString();
+  const st = _cnt.get(el);
+  const from = st ? st.cur : to;
+  if(st && st.raf) cancelAnimationFrame(st.raf);
+  if(from === to){ el.textContent = fmt(to); _cnt.set(el, {cur:to, raf:0}); return; }
+  const t0 = performance.now(), dur = 420;
+  const step = now=>{
+    const k = Math.min(1, (now - t0)/dur), e = 1 - Math.pow(1-k, 3);
+    const cur = from + (to-from)*e;
+    el.textContent = fmt(cur);
+    _cnt.set(el, { cur, raf: k < 1 ? requestAnimationFrame(step) : 0 });
+  };
+  _cnt.set(el, { cur:from, raf: requestAnimationFrame(step) });
+}
+
+function syncFloatBtn(){
+  const on = !!(S.model && S.model.hasSoft && S.model.hasSoft());
+  $('#btnFloat').style.display = on ? '' : 'none';
+}
 function renderHUD(){
-  const m = S.model, t = S.tal;
-  $('#hud').innerHTML = '<b>' + esc(m.meta.title||'名称未設定') + '</b><br>' +
-    '本体 ' + t.core[0] + '×' + t.core[1] + '　高さ ' + t.foot[2] + '　ブロック ' + t.total + '個';
+  const m = S.model, t = S.tal, h = $('#hud');
+  syncFloatBtn();
+  // ブロック数と密度（§5）＝影の濃さ・硬さ・広がりを決めている当の値。
+  // 装飾が何を表しているかを1行で明かす。装飾だけだと読む側は確信が持てない。
+  const title = m.meta.title || '名称未設定';
+  if(h.dataset.t !== title){
+    h.dataset.t = title;
+    h.innerHTML = '<b>' + esc(title) + '</b><br>' +
+      '本体 <span id="hudCore"></span>　高さ <span id="hudH"></span>' +
+      '　ブロック <span id="hudB"></span>個　密度 <span id="hudD"></span>';
+  }
+  $('#hudCore').textContent = t.core[0] + '×' + t.core[1];
+  $('#hudH').textContent = t.foot[2];
+  countTo($('#hudB'), MASS.blocks, 0);
+  countTo($('#hudD'), MASS.density, 2);
 }
 
 /* ---------- タブ：設計図 ---------- */
@@ -1353,6 +2029,7 @@ function renderInfo(){
 
     <h2 class="sec">素材パレットを着せ替える</h2>
     <select id="selPal">${palOpts}</select>
+    <button class="btn" id="btnPalNext" style="margin-top:6px">次の地区へ着替える →<small>形は1ビットも動かない。多い素材ほど遅れて変わる</small></button>
     <div class="tiny muted" style="margin-top:5px">同じ構造のまま、地区ごとの素材言語で読み直す。構造と素材は別の層。</div>
 
     <h2 class="sec">寸法と判定</h2>
@@ -1377,13 +2054,12 @@ function renderInfo(){
     applyModel(fromGrid(s), '見本を出す前の形');
     toast('見本：' + s.title + '　前の形は Ctrl+Z で戻る', 3400);
   };
-  $('#selPal').onchange = e=>{
-    const id = e.target.value;
-    const src = PALETTES[id].p;
-    const np = {};
-    for(const k in S.model.palette) np[k] = src[k] || S.model.palette[k];
-    S.model.palette = np; S.model.meta.paletteId = id;
-    rebuild(); renderMat(); renderInfo(); saveSoon();
+  $('#selPal').onchange = e=> applyPalette(e.target.value);
+  $('#btnPalNext').onclick = ()=>{
+    // 同じ形のまま次の地区へ。押し続けると、形が動かないことが体で分かる。
+    const ids = Object.keys(PALETTES);
+    const i = ids.indexOf(S.model.meta.paletteId);
+    applyPalette(ids[(i + 1 + ids.length) % ids.length]);
   };
 }
 
@@ -1781,30 +2457,21 @@ function bindImgInput(){
         imgs = await Promise.all(files.map(loadImage));
         title = files[0].name.replace(/\.[^.]+$/,'') + (files.length>1 ? ' ほか'+files.length+'枚' : '');
       }
-      let shots;
-      const warn = [];
-      if(mode === 'cross'){
-        if(imgs.length < 2){ toast('交差は2枚いる（1枚目＝正面、2枚目＝側面）', 4000); return; }
-        let front = rasterize(imgs[0], cols);
-        if(front.h > RASTER_MAX){
-          front = rasterizeH(imgs[0], RASTER_MAX);       // 高さを先に丸めてから側面を合わせる
-          warn.push('縦長すぎたので高さ' + RASTER_MAX + 'マスに収めた（横' + front.w + 'マス）');
-        }
-        const side = rasterizeH(imgs[1], front.h);
-        if(side.h !== front.h) warn.push('側面の背丈を合わせられなかった');
-        shots = [front, side];
-      } else {
-        shots = imgs.map(im => rasterize(im, cols));
-      }
+      if(mode === 'cross' && imgs.length < 2){ toast('交差は2枚いる（1枚目＝正面、2枚目＝側面）', 4000); return; }
+      const rr = shotsFrom(imgs, mode, cols);
+      const shots = rr.shots, warn = rr.warn.slice();
+      const colorMode = $('#imgColor').value, pal0 = S.model.palette;
       const m = imagesToModel(shots, {
-        mode, colorMode:$('#imgColor').value, maxColors:10,
+        mode, colorMode, maxColors:10,
         depth:extra, maxH:extra, title
-      }, S.model.palette);
+      }, pal0);
       const n = m.data.filter(k=>!AIR.has(k)).length;
       if(!n){ toast('ブロックが1個も取れなかった。白背景だけ／透明だけかも', 4000); return; }
       if(n > 30000) warn.push('ブロック' + n + '個で重い。横のマス数を減らすと軽くなる');
       m.warn = warn.concat(m.warn || []);
-      applyModel(m, '絵から立てる前の形');
+      // 元の絵を持っておく＝粗さスライダーで刻み直せる（元より細かくもできる）
+      applyModel(m, '絵から立てる前の形',
+        { kind:'img', imgs, mode, extra, colorMode, title, cols, refW:cols, palette:pal0 });
       toast(imgs.length + (psdFile ? '層' : '枚') + 'から ' + n + 'ブロック立てた');
     }catch(e){ toast('読めなかった：' + e.message, 5200); }
   };
@@ -2051,6 +2718,21 @@ function loadImage(file){
   });
 }
 const RASTER_MAX = 96;
+/* 絵 → 何マスかに刻む。粗さスライダーからも同じ道を通る。 */
+function shotsFrom(imgs, mode, cols){
+  const warn = [];
+  if(mode === 'cross'){
+    let front = rasterize(imgs[0], cols);
+    if(front.h > RASTER_MAX){
+      front = rasterizeH(imgs[0], RASTER_MAX);       // 高さを先に丸めてから側面を合わせる
+      warn.push('縦長すぎたので高さ' + RASTER_MAX + 'マスに収めた（横' + front.w + 'マス）');
+    }
+    const side = rasterizeH(imgs[1], front.h);
+    if(side.h !== front.h) warn.push('側面の背丈を合わせられなかった');
+    return { shots:[front, side], warn };
+  }
+  return { shots: imgs.map(im => rasterize(im, cols)), warn };
+}
 function rasterize(im, cols){
   const w = Math.max(1, Math.min(cols, RASTER_MAX));
   const h = Math.max(1, Math.round(im.height * (w / im.width)));
@@ -2209,6 +2891,38 @@ document.querySelectorAll('#tabs button').forEach(b=>{
 $('#btnSpin').onclick = e=>{ spinning = !spinning; e.target.classList.toggle('on', spinning); };
 $('#btnGrid').onclick = e=>{ S.grid = !S.grid; e.target.classList.toggle('on', S.grid); if(gridHelper) gridHelper.visible = S.grid; };
 $('#btnEdge').onclick = e=>{ S.edge = !S.edge; e.target.classList.toggle('on', S.edge); rebuild(); };
+(function bindCoarse(){
+  const el = $('#coarseRange');
+  let pending = 0, want = null, marked = false;
+  el.addEventListener('pointerdown', ()=>{ marked = false; });
+  el.oninput = ()=>{
+    const r = coarseRange(); if(!r) return;
+    want = Math.max(r.min, Math.min(r.max, +el.value));
+    labelCoarse(want, r.max);
+    if(!marked){ snapshot('粗さを変える前の形'); marked = true; }   // ドラッグ1回につき1手だけ積む
+    if(pending) return;
+    // 刻み直しは重いので、1フレームに1回だけ走らせる（つまみは滑らかに動く）
+    pending = requestAnimationFrame(()=>{ pending = 0; applyCoarse(want); });
+  };
+})();
+
+$('#btnFloat').onclick = e=>{
+  FLOATY = !FLOATY;
+  e.target.classList.toggle('on', FLOATY);
+  rebuild();
+  toast(FLOATY ? 'ゆらぎを戻した' : '全部を1.0に固めた——揺れが止まって、世界が完成した');
+};
+$('#btnMat').onclick = e=>{
+  const on = toggleMatColor();
+  e.target.classList.toggle('on', on);
+  toast(on ? '素材を着せ直した' : '色を外した——同じ形のまま、構造だけが残る');
+};
+$('#btnWeight').onclick = e=>{
+  WEIGHT = !WEIGHT;
+  e.target.classList.toggle('on', WEIGHT);
+  rebuild();
+  toast(WEIGHT ? '重さを戻した' : '重さを消した——影も三面の明度も無い状態');
+};
 $('#btnFit').onclick = ()=> fitCam(S.model);
 $('#btnBuild').onclick = ()=>{
   const Y = S.model.size[1];
