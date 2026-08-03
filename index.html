@@ -199,7 +199,7 @@
   <aside id="side">
     <div id="brand">
       <h1>IMASICA</h1>
-      <div class="sub">想像を立体で書く ／ IMASICA形式 v0 <span id="saveDot"></span></div>
+      <div class="sub">想像を立体で書く ／ <span id="fmtLab">IMASICA形式 v0</span> <span id="saveDot"></span></div>
     </div>
     <nav id="tabs">
       <button data-p="info" class="on">設計図</button>
@@ -908,12 +908,18 @@ async function unpackURL(s){
 function toBlenderPy(m){
   const [X,Y,Z] = m.size;
   const used = {};
-  const list = [];
+  const list = [], soft = [];
+  /* 半分あるセル（存在度 < 1.0）を**捨てない**。別リストに分けて、Blender 側で
+     「未確定」コレクションに入れる。決めるのは向こうで見てからでいい。
+     全部建てると「まだ決めていない」という情報が消え、
+     飛ばすと形が欠ける。分けるのが正しい。 */
   for(let y=0;y<Y;y++) for(let z=0;z<Z;z++) for(let x=0;x<X;x++){
     const k = m.get(x,y,z);
     if(AIR.has(k)) continue;
     used[k] = m.palette[k] ? m.palette[k].color : '#999999';
-    list.push([x,y,z,k]);
+    const pv = m.p(x,y,z);
+    if(pv >= 1) list.push([x,y,z,k]);
+    else soft.push([x,y,z,k, Math.round(pv*PRES_STEPS)]);   // 0〜9 の目盛りのまま渡す
   }
   const hex2rgb = h => {
     const n = parseInt(h.slice(1),16);
@@ -921,13 +927,16 @@ function toBlenderPy(m){
     return '(' + f((n>>16)&255) + ',' + f((n>>8)&255) + ',' + f(n&255) + ',1)';
   };
   let py = '# IMASICA形式 → Blender  (blender-mcp の execute_blender_code に貼る)\n';
-  py += '# ' + (m.meta.title||'') + '  size=' + X + 'x' + Y + 'x' + Z + '  blocks=' + list.length + '\n';
+  py += '# ' + (m.meta.title||'') + '  size=' + X + 'x' + Y + 'x' + Z
+      + '  blocks=' + list.length + (soft.length ? ('  未確定=' + soft.length) : '') + '\n';
   py += 'import bpy, bmesh\n\n';
   py += 'S = ' + (m.meta.scale_m || 1) + '   # 1セル = S メートル\n';
   py += 'PAL = {\n';
   for(const k in used) py += '  ' + JSON.stringify(k) + ': ' + hex2rgb(used[k]) + ',\n';
   py += '}\n';
-  py += 'VOX = ' + JSON.stringify(list).replace(/"/g,"'") + '\n\n';
+  py += 'VOX = ' + JSON.stringify(list).replace(/"/g,"'") + '\n';
+  py += 'SOFT = ' + JSON.stringify(soft).replace(/"/g,"'") + '   # [x,y,z,素材,存在度0-9]\n';
+  py += 'STEPS = ' + PRES_STEPS + '\n\n';
   py += [
     'root = bpy.data.objects.new("' + String(m.meta.title||'imasica').replace(/"/g,'') + '", None)',
     'bpy.context.collection.objects.link(root)',
@@ -957,7 +966,37 @@ function toBlenderPy(m){
     '    bpy.context.collection.objects.link(ob)',
     '    ob.parent = root',
     '',
-    'print("IMASICA: placed", len(VOX), "blocks in", len(groups), "groups")'
+    '# --- 半分あるセル（存在度 < 1.0）は「未確定」コレクションへ ---',
+    '# 消していないし、確定もしていない。見てから決められる状態のまま渡す。',
+    'if SOFT:',
+    '    col = bpy.data.collections.new("未確定")',
+    '    bpy.context.scene.collection.children.link(col)',
+    '    sg = {}',
+    '    for (x, y, z, k, p) in SOFT:',
+    '        sg.setdefault((k, p), []).append((x, y, z))',
+    '    for (k, p), cells in sg.items():',
+    '        a = p / STEPS',
+    '        sm = bpy.data.materials.new("blk_%s_p%d" % (k, p))',
+    '        sm.use_nodes = True',
+    '        c = PAL.get(k, (0.5, 0.5, 0.5, 1))',
+    '        nd = sm.node_tree.nodes["Principled BSDF"]',
+    '        nd.inputs["Base Color"].default_value = c',
+    '        nd.inputs["Alpha"].default_value = a',
+    '        sm.blend_method = "BLEND"',
+    '        sm.diffuse_color = (c[0], c[1], c[2], a)',
+    '        bm = bmesh.new()',
+    '        for (x, y, z) in cells:',
+    '            mat = __import__("mathutils").Matrix.Translation((x * S, z * S, y * S))',
+    '            bmesh.ops.create_cube(bm, size=S, matrix=mat)',
+    '        me = bpy.data.meshes.new("mesh_%s_p%d" % (k, p))',
+    '        bm.to_mesh(me); bm.free()',
+    '        ob = bpy.data.objects.new("blk_%s_p%d" % (k, p), me)',
+    '        ob.data.materials.append(sm)',
+    '        col.objects.link(ob)',
+    '        ob.parent = root',
+    '',
+    'print("IMASICA: placed", len(VOX), "blocks in", len(groups), "groups;",',
+    '      len(SOFT), "unconfirmed in collection 未確定")'
   ].join('\n') + '\n';
   return py;
 }
@@ -1989,9 +2028,17 @@ function countTo(el, to, dp){
   _cnt.set(el, { cur:from, raf: requestAnimationFrame(step) });
 }
 
+/* いま開いている形が v0 なのか v1 なのかを、看板に出す。
+   固定で「v1」と書くと、存在度を使っていないモデルを書き出したとき（＝ほとんどの場合）
+   JSON には v0 と書かれるので嘘になる。**書いた分だけ v1**、が形式の側の約束。 */
+const fmtOf = m => (m && m.hasSoft && m.hasSoft()) ? 'v1' : 'v0';
 function syncFloatBtn(){
   const on = !!(S.model && S.model.hasSoft && S.model.hasSoft());
   $('#btnFloat').style.display = on ? '' : 'none';
+  $('#fmtLab').textContent = 'IMASICA形式 ' + fmtOf(S.model);
+  $('#fmtLab').title = on
+    ? '存在度（半分ある）を使っているので v1 で書き出される'
+    : '存在度は全部 1.0。v0 とまったく同じものが書き出される';
 }
 function renderHUD(){
   const m = S.model, t = S.tal, h = $('#hud');
@@ -2597,7 +2644,7 @@ function exportCard(){
     g.fillText(t.total+' 個', W-pad, y+28); g.textAlign='left';
     // フッタ
     g.fillStyle = '#5c6473'; g.font = '13px "Noto Sans JP", sans-serif';
-    g.fillText('IMASICA形式 v0 ／ ' + (m.meta.notes ? m.meta.notes.slice(0,54) : 'ブロック建築の立体設計図'), pad, H-24);
+    g.fillText('IMASICA形式 ' + fmtOf(m) + ' ／ ' + (m.meta.notes ? m.meta.notes.slice(0,54) : 'ブロック建築の立体設計図'), pad, H-24);
     c.toBlob(b=>{
       saveBlob((m.meta.title||'imasica').replace(/[\\/:*?"<>|]/g,'_') + '.png', b);
       toast('設計図カードを保存した');
