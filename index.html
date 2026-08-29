@@ -39,6 +39,15 @@
   #brand .sub{color:var(--dim); font-size:11.5px; margin-top:2px; letter-spacing:.04em}
   #saveDot{opacity:0; transition:opacity .25s; color:var(--accent2); margin-left:6px}
   #saveDot.on{opacity:1}
+  #menoBridge{display:none; width:100%; margin:9px 0 0; padding:8px 10px; border-radius:8px;
+    border:1px solid #3d789f; background:#18344a; color:#d9efff; font-family:inherit;
+    font-size:11.5px; font-weight:700; text-align:left; cursor:pointer}
+  #menoBridge.on{display:block}
+  #menoBridge small{display:block; color:#91bdd8; font-size:10px; font-weight:400; margin-top:1px}
+  .meno-card{margin:0 0 14px; padding:12px; border:1px solid #3d789f; border-radius:10px;
+    background:linear-gradient(145deg,#172c3e,#1e3b50)}
+  .meno-card b{color:#d9efff}
+  .meno-card .meta{color:#9cc5dd; font-size:11px; margin:3px 0 8px}
   #tabs{display:flex; border-bottom:1px solid var(--line); background:var(--panel)}
   #tabs button{
     flex:1; padding:10px 4px; background:none; border:none; border-bottom:2px solid transparent;
@@ -200,6 +209,7 @@
     <div id="brand">
       <h1>IMASICA</h1>
       <div class="sub">想像を立体で書く ／ <span id="fmtLab">IMASICA形式 v0</span> <span id="saveDot"></span></div>
+      <button id="menoBridge" type="button">メの島へ設計を渡す<small>確認してから家族共有へ登録</small></button>
     </div>
     <nav id="tabs">
       <button data-p="info" class="on">設計図</button>
@@ -902,6 +912,120 @@ async function unpackURL(s){
     return new TextDecoder().decode(buf);
   }
   return new TextDecoder().decode(body);
+}
+
+/* ---- メの島との往復（秘密の合言葉は # 以降だけで運ぶ） ---- */
+function bridgeTextEncode(value){
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let raw = '';
+  for(let i=0;i<bytes.length;i+=0x4000) raw += String.fromCharCode(...bytes.subarray(i, i+0x4000));
+  return btoa(raw).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,'');
+}
+function bridgeTextDecode(value){
+  let s = String(value || '').replace(/-/g,'+').replace(/_/g,'/');
+  s += '='.repeat((4 - s.length % 4) % 4);
+  const raw = atob(s), bytes = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) bytes[i] = raw.charCodeAt(i);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+function clampInt(value, min, max, fallback){
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+function cleanBridgeText(value, max){
+  return String(value || '').replace(/[\u0000-\u001f\u007f]/g,'').replace(/\s+/g,' ').trim().slice(0,max);
+}
+function parseMenoContext(encoded){
+  if(!encoded || encoded.length > 24000) throw new Error('メの島の連携情報が大きすぎる');
+  const c = bridgeTextDecode(encoded);
+  if(!c || c.v !== 1 || c.source !== 'menoshima') throw new Error('メの島の連携形式が違う');
+  const back = new URL(c.returnUrl);
+  const local = back.hostname === 'localhost' || back.hostname === '127.0.0.1';
+  if(back.protocol !== 'https:' && !local) throw new Error('安全な戻り先ではない');
+  if(back.hostname !== 'menoshima.kagami-osakenpiro.workers.dev' && !local) throw new Error('メの島以外の戻り先は使えない');
+  const district = ['うみべ','かざん','こうや','うきしま','まっさら街'].includes(c.district) ? c.district : 'うみべ';
+  const d = c.draft || {};
+  return {
+    v:1, source:'menoshima', returnUrl:back.origin + back.pathname + back.search,
+    district, who:cleanBridgeText(c.who,32) || 'ケンシロウ',
+    title:cleanBridgeText(c.title,80) || 'IMASICA設計',
+    targetBuilding:cleanBridgeText(c.targetBuilding,80),
+    pattern:{code:cleanBridgeText(c.pattern && c.pattern.code,16) || 'IMASICA', name:cleanBridgeText(c.pattern && c.pattern.name,64) || 'フル3D設計'},
+    draft:{width:clampInt(d.width,2,30,6), depth:clampInt(d.depth,2,30,5), height:clampInt(d.height,2,12,3),
+      floors:clampInt(d.floors,1,8,1), openings:clampInt(d.openings,0,60,30)}
+  };
+}
+function menoPaletteId(district){
+  return ({'うみべ':'umibe','かざん':'kazan','こうや':'kouya','うきしま':'ukishima','まっさら街':'massara'})[district] || 'umibe';
+}
+function fromMenoDraft(ctx){
+  const d = ctx.draft, X=d.width, Z=d.depth, floorH=d.height, floors=d.floors;
+  const Y = Math.min(96, floorH * floors + 1), data = new Array(X*Y*Z).fill('.');
+  const code = ctx.pattern.code;
+  const inside = (x,z,y)=>{
+    if(x<0 || z<0 || x>=X || z>=Z) return false;
+    if(code === 'P1') return x < Math.ceil(X*.48) || z >= Math.floor(Z*.52);
+    if(code === 'P2') return z < Math.ceil(Z*.42) || (x >= Math.floor(X*.34) && x < Math.ceil(X*.66));
+    if(code === 'P3') return x < Math.ceil(X*.28) || x >= Math.floor(X*.72) || z >= Math.floor(Z*.62);
+    if(code === 'P4') return !(x >= Math.floor(X*.3) && x < Math.ceil(X*.7) && z >= Math.floor(Z*.3) && z < Math.ceil(Z*.7));
+    if(code === 'P5') return x < Math.ceil(X*.36) || x >= Math.floor(X*.64) || (z >= Math.floor(Z*.45) && z < Math.ceil(Z*.58));
+    if(code === 'P6') return (x < Math.ceil(X*.28)) || (x >= Math.floor(X*.36) && x < Math.ceil(X*.64)) || x >= Math.floor(X*.72);
+    if(code === 'P7'){
+      const inset = Math.min(Math.floor(Math.min(X,Z)/3), Math.floor((y||0)/Math.max(1,floorH)));
+      return x>=inset && z>=inset && x<X-inset && z<Z-inset;
+    }
+    return true;
+  };
+  const put = (x,y,z,k)=>{ if(x>=0&&y>=0&&z>=0&&x<X&&y<Y&&z<Z) data[(y*Z+z)*X+x]=k; };
+  const openStride = d.openings >= 45 ? 2 : d.openings >= 20 ? 3 : 5;
+  for(let y=0;y<Y;y++) for(let z=0;z<Z;z++) for(let x=0;x<X;x++){
+    if(!inside(x,z,y)) continue;
+    if(y === Y-1){ put(x,y,z,'R'); continue; }
+    const level = y % floorH, boundary = !inside(x-1,z,y)||!inside(x+1,z,y)||!inside(x,z-1,y)||!inside(x,z+1,y);
+    if(level === 0){ put(x,y,z,'F'); continue; }
+    if(!boundary) continue;
+    const piloti = (code === 'V2' || code === 'V3') && y < floorH;
+    if(piloti){
+      if((x===0||x===X-1) && (z===0||z===Z-1)) put(x,y,z,'P');
+      continue;
+    }
+    const front = z === 0, door = front && x === Math.floor(X/2) && y === 1;
+    const window = d.openings > 0 && level === Math.max(1,Math.floor(floorH/2)) && ((front && x%openStride===1) || (!front && z%openStride===1));
+    put(x,y,z,door?'D':window?'G':'W');
+  }
+  const pid = menoPaletteId(ctx.district), P = PALETTES[pid] || PALETTES.umibe;
+  return mkModel([X,Y,Z], data, P.p, {
+    title:ctx.title, author:ctx.who, target:'pokopoke', scale_m:1, paletteId:pid,
+    notes:ctx.pattern.code+' '+ctx.pattern.name+'から起こしたメの島の素体。IMASICAで形と素材を直してから島へ戻す。',
+    tags:['メの島',ctx.district,ctx.pattern.code]
+  });
+}
+function renderMenoBridge(){
+  const b = $('#menoBridge');
+  if(!b) return;
+  b.classList.toggle('on', !!MENO_CONTEXT);
+  if(!MENO_CONTEXT){ b.onclick = null; return; }
+  b.innerHTML = 'メの島へ設計を渡す<small>' + esc(MENO_CONTEXT.targetBuilding ? MENO_CONTEXT.targetBuilding+'を更新' : MENO_CONTEXT.district+'へ新規登録') + '・確認後に家族共有</small>';
+  b.onclick = returnToMeno;
+}
+async function returnToMeno(){
+  if(!MENO_CONTEXT || !S.model) return;
+  try{
+    const packed = await packURL(toJSON(S.model,false));
+    const t = S.tal || tally(S.model), m = S.model;
+    const payload = {
+      v:1, source:'imasica', title:m.meta.title || MENO_CONTEXT.title,
+      targetBuilding:MENO_CONTEXT.targetBuilding || '', district:MENO_CONTEXT.district, who:MENO_CONTEXT.who,
+      pattern:MENO_CONTEXT.pattern, size:m.size, total:t.total, openings:Math.round(t.openRate*100),
+      format:'imasica/'+fmtOf(m),
+      materials:Object.keys(t.counts).map(k=>({name:(m.palette[k]||{}).name||k, role:(m.palette[k]||{}).role||'', count:t.counts[k]}))
+    };
+    const url = MENO_CONTEXT.returnUrl + '#imasica=' + bridgeTextEncode(payload) + '&d=' + packed;
+    if(url.length > 800000){ toast('設計が大きすぎてURLで島へ戻せない。JSONで保存してから形を粗くして', 6000); return; }
+    location.href = url;
+  }catch(e){
+    console.warn(e); toast('メの島へ渡せない：'+e.message, 5200);
+  }
 }
 
 /* ---- Blender へ渡す Python（blender-mcp の execute_blender_code にそのまま貼れる） ---- */
@@ -1663,6 +1787,7 @@ function loop(now){
    UI
    ========================================================================== */
 const S = { model:null, solo:null, hidden:new Set(), maxY:0, grid:true, edge:true, sampleKey:'B', tal:null, world:[], edit:false, brush:null, dirty:false, origin:null, hard:1 };
+let MENO_CONTEXT = null;
 const $ = s => document.querySelector(s);
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -2007,7 +2132,7 @@ function setModel(m, opts){
   syncCoarse();
   rebuild();
   if(opts.fit !== false) fitCam(m);
-  renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD(); renderEdit();
+  renderInfo(); renderMat(); renderPlan(); renderImg(); renderIO(); renderHUD(); renderEdit(); renderMenoBridge();
 }
 /* 数値変化はカウントアップで出す（正典）。スライダーを引いている間も追従する。 */
 const _cnt = new WeakMap();
@@ -2217,6 +2342,12 @@ function renderIO(){
   $('#pane-io').innerHTML = `
     <div class="tiny muted" style="margin-bottom:2px">形の入口は3つ。三相と同じ並びにしてある。</div>
 
+    ${MENO_CONTEXT ? `<div class="meno-card">
+      <b>メの島と接続中</b>
+      <div class="meta">${esc(MENO_CONTEXT.district)} ／ ${esc(MENO_CONTEXT.targetBuilding ? MENO_CONTEXT.targetBuilding+'を更新' : '新しい建物')} ／ 担当 ${esc(MENO_CONTEXT.who)}</div>
+      <button class="btn pri" id="btnMenoReturn">この3D設計をメの島へ渡す<small>島側で内容を確認してから、家族共有データへ保存する</small></button>
+    </div>` : ''}
+
     <h2 class="sec">WONDER ／ AIに描かせる</h2>
     <div class="tiny muted" style="margin-bottom:7px">
       自分の手の外から、まだ無い形が来る。注文を書いてボタンを押すと、仕様書つきのプロンプトが出る。
@@ -2268,6 +2399,7 @@ function renderIO(){
     </div>`;
 
   renderWorld();
+  if($('#btnMenoReturn')) $('#btnMenoReturn').onclick = returnToMeno;
   $('#btnPrompt').onclick = ()=> copy(aiPrompt(S.model, $('#wantTxt').value.trim()), 'プロンプトを');
   $('#btnWorldAdd').onclick = ()=>{
     const m = S.model;
@@ -3019,7 +3151,13 @@ CV.addEventListener('click', e=>{
 (async function boot(){
   resize(); loop();
   let msg = null;
-  const h = location.hash;
+  const hp = new URLSearchParams(location.hash.slice(1));
+  const packedDesign = hp.get('d') || '';
+  const menoParam = hp.get('meno') || '';
+  if(menoParam){
+    try{ MENO_CONTEXT = parseMenoContext(menoParam); }
+    catch(e){ console.warn(e); msg = 'メの島との接続情報を読めなかった。通常モードで開いている'; }
+  }
 
   // 共有リンクが最優先。ただし前回の作業は消さずに履歴へ積む（Ctrl+Z で自分の形に戻れる）。
   const saved = restoreSaved();
@@ -3030,20 +3168,26 @@ CV.addEventListener('click', e=>{
     msg = '前回の続きから（' + agoText(saved.at) + '）' +
           (S.world.length ? '　世界' + S.world.length + '棟も戻した' : '');
   }
-  if(h && h.indexOf('#d=') === 0){
+  if(packedDesign){
     try{
-      const m = fromJSON(await unpackURL(h.slice(3)));
+      const m = fromJSON(await unpackURL(packedDesign));
       setModel(m, { from: saved ? '前回の続き' : undefined, history: !!saved });
-      msg = saved
-        ? '共有リンクを開いた。前回の自分の形は Ctrl+Z で戻る'
-        : '共有リンクから読み込んだ';
+      msg = MENO_CONTEXT
+        ? 'メの島の3D設計を開いた。直したら「メの島へ設計を渡す」'
+        : saved ? '共有リンクを開いた。前回の自分の形は Ctrl+Z で戻る' : '共有リンクから読み込んだ';
     }catch(e){
       console.warn(e);
       if(!saved) msg = '共有リンクが壊れている。見本を表示する';
       else msg = '共有リンクが壊れていた。前回の続きを出している';
     }
+  } else if(MENO_CONTEXT){
+    try{
+      setModel(fromMenoDraft(MENO_CONTEXT), { from:saved ? '前回の続き' : undefined, history:!!saved });
+      msg = 'メの島の条件から3Dの素体を作った。形を直して島へ戻せる';
+    }catch(e){ console.warn(e); msg = 'メの島の素体を作れなかった。見本から始める'; }
   }
   if(!S.model) setModel(fromGrid(SAMPLES[0]), { history:false });
+  renderMenoBridge();
   if(msg) setTimeout(()=>toast(msg, 4200), 400);
   setTimeout(resize, 60);
 })();
